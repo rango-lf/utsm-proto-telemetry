@@ -1,341 +1,453 @@
+"""Strategy and efficiency analysis for UTSM Shell Eco-Marathon telemetry runs.
+
+Usage
+-----
+python analyze_strategy.py Utsm.gpx telemetry_20260411_112302.csv \\
+    --laps 4 --segments 12 --split-method start --output-prefix outputs/run1_strategy
+
+This script imports all heavy-lifting helpers from utsm_telemetry.core so
+there is no duplicated alignment or lap-splitting code.
+"""
+
+from __future__ import annotations
+
 import argparse
-import importlib.util
-from pathlib import Path
+import os
+import sys
 
-import numpy as np
-import pandas as pd
+try:
+    import numpy as np
+    import pandas as pd
+except ImportError as exc:
+    raise SystemExit(
+        "Missing required package. Install dependencies with: pip install matplotlib pandas numpy"
+    ) from exc
+
+# ---------------------------------------------------------------------------
+# Import shared helpers
+# ---------------------------------------------------------------------------
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
+from utsm_telemetry import (
+    read_gpx,
+    read_telemetry,
+    align_telemetry,
+    find_start_spike,
+    find_nearest_gps_index,
+    find_lap_boundaries_by_y_crossing,
+    split_gps_into_laps,
+    merge_by_time,
+    derive_motion_energy,
+    parse_lap_time,
+    parse_iso8601,
+)
 
 
-def load_heatmap_module():
-    module_path = Path(__file__).with_name("gps_current_heatmap.py")
-    spec = importlib.util.spec_from_file_location("gps_current_heatmap", module_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Could not load helper module from {module_path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-hm = load_heatmap_module()
-
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Analyze lap strategy, speed, grade, and energy efficiency from GPX + telemetry."
+        description="Generate lap, sector, and flat-speed efficiency reports from a UTSM run."
     )
-    parser.add_argument("gps", help="Path to a GPX file with timestamps")
-    parser.add_argument("telemetry", help="Path to a telemetry CSV dump")
-    parser.add_argument("--laps", type=int, default=4, help="Number of laps to analyze")
+    parser.add_argument("gps", help="Path to the GPX track file")
+    parser.add_argument("telemetry", help="Path to the telemetry CSV file")
     parser.add_argument(
-        "--segments",
-        type=int,
-        default=12,
-        help="Number of equal-distance sectors per lap for segment analysis",
+        "--laps", type=int, default=4,
+        help="Number of laps expected in the run",
+    )
+    parser.add_argument(
+        "--segments", type=int, default=12,
+        help="Number of equal-distance sectors per lap",
     )
     parser.add_argument(
         "--split-method",
-        choices=["start", "points", "time", "line"],
+        choices=["points", "time", "line", "start"],
         default="start",
-        help="Lap split mode. 'start' uses the first current spike and Y-crossing logic.",
     )
     parser.add_argument(
-        "--tolerance-sec",
-        type=float,
-        default=1.5,
-        help="Nearest-time merge tolerance between GPX and telemetry",
-    )
-    parser.add_argument(
-        "--time-offset-ms",
-        type=float,
-        default=0.0,
-        help="Manual timing offset applied to telemetry after alignment",
+        "--lap-times", nargs="+", metavar="ELAPSED",
+        help="Elapsed MM:SS or H:MM:SS times for each lap start",
     )
     parser.add_argument(
         "--start-time",
-        help="Manual telemetry start time in ISO 8601 format",
+        help="ISO 8601 timestamp to force-align telemetry start",
     )
     parser.add_argument(
-        "--output-prefix",
-        default="strategy_analysis",
-        help="Prefix for generated CSV and text reports",
+        "--time-offset-ms", type=float, default=0.0,
+        help="Millisecond offset added to telemetry timestamps after alignment",
+    )
+    parser.add_argument(
+        "--tolerance-sec", type=float, default=1.5,
+        help="Max seconds tolerance for GPS/telemetry time merge",
+    )
+    parser.add_argument(
+        "--output-prefix", default="outputs/strategy",
+        help="Prefix for output files (e.g. outputs/run1_strategy)",
     )
     return parser.parse_args()
 
 
-def merge_gps_to_telemetry(
-    gps: pd.DataFrame, telemetry: pd.DataFrame, tolerance_sec: float
-) -> pd.DataFrame:
-    gps_sorted = gps.sort_values("time").reset_index(drop=True).copy()
-    telem_sorted = telemetry.sort_values("time").reset_index(drop=True).copy()
-    merged = pd.merge_asof(
-        gps_sorted,
-        telem_sorted,
-        on="time",
-        direction="nearest",
-        tolerance=pd.Timedelta(seconds=tolerance_sec),
-    )
-    merged = merged.dropna(subset=["current_mA", "voltage_mV"]).reset_index(drop=True)
-    if merged.empty:
-        raise ValueError("No GPS points matched telemetry within the requested tolerance.")
-    return merged
+# ---------------------------------------------------------------------------
+# Build laps (handles all split modes)
+# ---------------------------------------------------------------------------
 
+def build_laps(
+    gps_df: pd.DataFrame,
+    telem_df: pd.DataFrame,
+    args: argparse.Namespace,
+) -> tuple[list[pd.DataFrame], list[pd.DataFrame], pd.DataFrame]:
+    """Return (list_of_gps_lap_dfs, list_of_telem_lap_dfs, aligned_telem_df).
 
-def enrich_motion(df: pd.DataFrame) -> pd.DataFrame:
-    df = hm.add_xy(df)
-    df = df.copy()
-    df["dt_s"] = df["time"].diff().dt.total_seconds().fillna(0.0).clip(lower=0.0)
-    df["dist_m"] = np.sqrt(df["x"].diff().fillna(0.0) ** 2 + df["y"].diff().fillna(0.0) ** 2)
-    df["elev_diff_m"] = df["elev"].diff().fillna(0.0)
-    df["speed_m_s"] = df["dist_m"] / df["dt_s"].replace(0.0, np.nan)
-    df["speed_kph"] = df["speed_m_s"] * 3.6
-    df["grade_pct"] = 100.0 * df["elev_diff_m"] / df["dist_m"].replace(0.0, np.nan)
-    df["power_w"] = (df["current_mA"].abs() * df["voltage_mV"]) / 1_000_000.0
-    df["energy_wh"] = df["power_w"] * df["dt_s"] / 3600.0
-    df["cumdist_m"] = df["dist_m"].cumsum()
-    return df
+    Mirrors the lap-building logic in gps_current_heatmap.py but returns
+    both sides of the merge so downstream functions can re-merge with
+    full energy channels.
+    """
+    if args.lap_times:
+        track_start = gps_df["time"].iloc[0]
+        lap_timestamps = [parse_lap_time(t, track_start) for t in args.lap_times]
+        if len(lap_timestamps) < 2:
+            raise ValueError("--lap-times requires at least 2 timestamps.")
+        spike_idx = find_start_spike(telem_df)
+        spike_ms = float(telem_df.loc[spike_idx, "timestamp_ms"])
+        telemetry_start = lap_timestamps[0] - pd.Timedelta(milliseconds=spike_ms)
+        telem_df = align_telemetry(telem_df, gps_df, telemetry_start, args.time_offset_ms)
 
+        gps_laps, telem_laps = [], []
+        for i in range(len(lap_timestamps) - 1):
+            ls, le = lap_timestamps[i], lap_timestamps[i + 1]
+            gps_laps.append(
+                gps_df[(gps_df["time"] >= ls) & (gps_df["time"] < le)]
+                .copy().reset_index(drop=True)
+            )
+            telem_laps.append(
+                telem_df[(telem_df["time"] >= ls) & (telem_df["time"] < le)]
+                .copy().reset_index(drop=True)
+            )
+        return gps_laps, telem_laps, telem_df
 
-def build_laps(args: argparse.Namespace) -> list[pd.DataFrame]:
-    gps_df = hm.read_gpx(args.gps)
-    telem_df = hm.read_telemetry(args.telemetry)
-    telem_df = hm.align_telemetry(telem_df, gps_df, args.start_time, args.time_offset_ms)
+    telem_df = align_telemetry(telem_df, gps_df, args.start_time, args.time_offset_ms)
 
     if args.split_method == "start":
-        start_idx = hm.find_start_spike(telem_df)
-        start_time = telem_df.loc[start_idx, "time"]
-        gps_start_idx = hm.find_nearest_gps_index(gps_df, start_time)
+        spike_idx = find_start_spike(telem_df)
+        start_time = telem_df.loc[spike_idx, "time"]
+        gps_start_idx = find_nearest_gps_index(gps_df, start_time)
+        print(
+            f"Start spike at telemetry index {spike_idx}, time {start_time}, "
+            f"matching GPS index {gps_start_idx}."
+        )
         gps_df = gps_df.loc[gps_start_idx:].reset_index(drop=True)
-        boundaries = hm.find_lap_boundaries_by_y_crossing(gps_df, 0, args.laps)
-        laps = []
+        boundaries = find_lap_boundaries_by_y_crossing(gps_df, 0, args.laps)
+        if len(boundaries) < args.laps + 1:
+            print(
+                f"Warning: only found {len(boundaries) - 1} complete laps "
+                f"(wanted {args.laps}). Last segment will be appended."
+            )
+        gps_laps = []
         for i in range(min(len(boundaries) - 1, args.laps)):
-            laps.append(gps_df.iloc[boundaries[i] : boundaries[i + 1]].reset_index(drop=True))
-        if len(laps) < args.laps and boundaries:
-            laps.append(gps_df.iloc[boundaries[-1] :].reset_index(drop=True))
+            gps_laps.append(
+                gps_df.iloc[boundaries[i]: boundaries[i + 1]].reset_index(drop=True)
+            )
+        if len(gps_laps) < args.laps and boundaries:
+            gps_laps.append(gps_df.iloc[boundaries[-1]:].reset_index(drop=True))
     else:
-        laps = hm.split_gps_into_laps(gps_df, args.laps, args.split_method)
+        gps_laps = split_gps_into_laps(gps_df, args.laps, args.split_method)
 
-    merged_laps = []
-    for idx, lap_gps in enumerate(laps, start=1):
+    telem_laps = []
+    for lap_gps in gps_laps:
         if lap_gps.empty:
+            telem_laps.append(pd.DataFrame())
             continue
-        lap_telem = telem_df[
-            (telem_df["time"] >= lap_gps["time"].iloc[0] - pd.Timedelta(seconds=args.tolerance_sec))
-            & (telem_df["time"] <= lap_gps["time"].iloc[-1] + pd.Timedelta(seconds=args.tolerance_sec))
-        ].copy()
-        merged = merge_gps_to_telemetry(lap_gps, lap_telem, args.tolerance_sec)
-        merged = enrich_motion(merged)
-        merged["lap"] = idx
-        merged_laps.append(merged)
-    return merged_laps
+        ls = lap_gps["time"].iloc[0]
+        le = lap_gps["time"].iloc[-1]
+        telem_laps.append(
+            telem_df[
+                (telem_df["time"] >= ls - pd.Timedelta(seconds=args.tolerance_sec))
+                & (telem_df["time"] <= le + pd.Timedelta(seconds=args.tolerance_sec))
+            ].copy().reset_index(drop=True)
+        )
+
+    return gps_laps, telem_laps, telem_df
 
 
-def summarize_laps(laps: list[pd.DataFrame]) -> pd.DataFrame:
+# ---------------------------------------------------------------------------
+# Summary builders
+# ---------------------------------------------------------------------------
+
+def build_lap_summary(lap_merged: pd.DataFrame, lap_num: int) -> dict:
+    """Build one-row lap summary dict from a merged+derived lap DataFrame."""
+    dur = (lap_merged["time"].iloc[-1] - lap_merged["time"].iloc[0]).total_seconds()
+    dist = float(lap_merged["cumdist_m"].iloc[-1]) if "cumdist_m" in lap_merged.columns else 0.0
+    avg_speed = dist / dur if dur > 0 else 0.0
+    total_energy = float(lap_merged["energy_wh"].sum())
+    efficiency = (total_energy / (dist / 1000.0)) if dist > 0 else float("nan")
+
+    elev_pos = float(lap_merged["elev_diff_m"].clip(lower=0).sum())
+    elev_neg = float(lap_merged["elev_diff_m"].clip(upper=0).sum())
+
+    return {
+        "lap": lap_num,
+        "duration_s": dur,
+        "distance_m": dist,
+        "avg_speed_kph": avg_speed * 3.6,
+        "avg_current_mA": float(lap_merged["current_mA"].mean()),
+        "max_current_mA": float(lap_merged["current_mA"].max()),
+        "avg_power_w": float(lap_merged["power_w"].mean()),
+        "total_energy_wh": total_energy,
+        "efficiency_wh_per_km": efficiency,
+        "elev_gain_m": elev_pos,
+        "elev_loss_m": abs(elev_neg),
+    }
+
+
+def build_sector_summary(lap_merged: pd.DataFrame, lap_num: int, n_segments: int) -> list[dict]:
+    """Split lap into equal-distance sectors and summarise each."""
+    total_dist = float(lap_merged["cumdist_m"].iloc[-1])
+    if total_dist == 0:
+        return []
+
+    sector_length = total_dist / n_segments
     rows = []
-    for lap in laps:
-        valid = lap[lap["dt_s"] > 0].copy()
-        if valid.empty:
+    for seg_idx in range(n_segments):
+        d_lo = seg_idx * sector_length
+        d_hi = (seg_idx + 1) * sector_length
+        seg = lap_merged[
+            (lap_merged["cumdist_m"] >= d_lo) & (lap_merged["cumdist_m"] < d_hi)
+        ]
+        if seg.empty:
             continue
-        duration_s = float(valid["dt_s"].sum())
-        distance_m = float(valid["dist_m"].sum())
-        energy_wh = float(valid["energy_wh"].sum())
-        rows.append(
-            {
-                "lap": int(valid["lap"].iloc[0]),
-                "duration_s": duration_s,
-                "distance_m": distance_m,
-                "avg_speed_kph": distance_m / duration_s * 3.6 if duration_s else np.nan,
-                "avg_current_a": float(valid["current_mA"].mean() / 1000.0),
-                "max_current_a": float(valid["current_mA"].max() / 1000.0),
-                "avg_power_w": energy_wh * 3600.0 / duration_s if duration_s else np.nan,
-                "energy_wh": energy_wh,
-                "wh_per_km": energy_wh / (distance_m / 1000.0) if distance_m else np.nan,
-                "elev_gain_m": float(valid.loc[valid["elev_diff_m"] > 0, "elev_diff_m"].sum()),
-                "elev_loss_m": float(-valid.loc[valid["elev_diff_m"] < 0, "elev_diff_m"].sum()),
-            }
-        )
-    return pd.DataFrame(rows)
+        dur = float(seg["dt_s"].sum())
+        dist = float(seg["dist_m"].sum())
+        energy = float(seg["energy_wh"].sum())
+        eff = (energy / (dist / 1000.0)) if dist > 0 else float("nan")
+        avg_speed = (dist / dur * 3.6) if dur > 0 else 0.0
+        rows.append({
+            "lap": lap_num,
+            "sector": seg_idx + 1,
+            "duration_s": dur,
+            "distance_m": dist,
+            "avg_speed_kph": avg_speed,
+            "avg_power_w": float(seg["power_w"].mean()),
+            "avg_current_mA": float(seg["current_mA"].mean()),
+            "max_current_mA": float(seg["current_mA"].max()),
+            "energy_wh": energy,
+            "efficiency_wh_per_km": eff,
+            "avg_grade_pct": float(seg["grade_pct"].mean()),
+            "peak_speed_kph": float(seg["speed_kph"].max()),
+        })
+    return rows
 
 
-def summarize_sectors(laps: list[pd.DataFrame], segments: int) -> pd.DataFrame:
+def build_speed_bins(all_laps_merged: list[pd.DataFrame], bin_size_kph: float = 5.0) -> list[dict]:
+    """Pool all laps and build flat-section efficiency by 5 km/h speed bands."""
+    if not all_laps_merged:
+        return []
+
+    combined = pd.concat(all_laps_merged, ignore_index=True)
+    flat = combined[
+        (combined["speed_kph"] >= 5)
+        & (combined["speed_kph"] <= 70)
+        & (combined["grade_pct"].abs() <= 1.0)
+    ].copy()
+
+    if flat.empty:
+        return []
+
+    flat["speed_bin"] = (flat["speed_kph"] // bin_size_kph) * bin_size_kph
     rows = []
-    for lap in laps:
-        valid = lap[lap["dt_s"] > 0].copy()
-        if valid.empty:
-            continue
-        total_dist = float(valid["dist_m"].sum())
-        valid["sector"] = np.minimum(
-            (valid["cumdist_m"] / max(total_dist, 1.0) * segments).astype(int),
-            segments - 1,
-        ) + 1
-        grouped = valid.groupby("sector", as_index=False)
-        for sector_df in [grouped.get_group(sector) for sector in grouped.groups]:
-            duration_s = float(sector_df["dt_s"].sum())
-            distance_m = float(sector_df["dist_m"].sum())
-            energy_wh = float(sector_df["energy_wh"].sum())
-            rows.append(
-                {
-                    "lap": int(sector_df["lap"].iloc[0]),
-                    "sector": int(sector_df["sector"].iloc[0]),
-                    "duration_s": duration_s,
-                    "distance_m": distance_m,
-                    "avg_speed_kph": distance_m / duration_s * 3.6 if duration_s else np.nan,
-                    "avg_power_w": energy_wh * 3600.0 / duration_s if duration_s else np.nan,
-                    "avg_current_a": float(sector_df["current_mA"].mean() / 1000.0),
-                    "max_current_a": float(sector_df["current_mA"].max() / 1000.0),
-                    "energy_wh": energy_wh,
-                    "wh_per_km": energy_wh / (distance_m / 1000.0) if distance_m else np.nan,
-                    "avg_grade_pct": float(sector_df["grade_pct"].mean(skipna=True)),
-                    "peak_speed_kph": float(sector_df["speed_kph"].max(skipna=True)),
-                }
-            )
-    return pd.DataFrame(rows)
+    for bin_lo, group in flat.groupby("speed_bin"):
+        dist_km = group["dist_m"].sum() / 1000.0
+        energy = group["energy_wh"].sum()
+        eff = energy / dist_km if dist_km > 0 else float("nan")
+        rows.append({
+            "speed_bin_lo_kph": float(bin_lo),
+            "speed_bin_hi_kph": float(bin_lo + bin_size_kph),
+            "sample_count": len(group),
+            "total_dist_km": dist_km,
+            "total_energy_wh": energy,
+            "efficiency_wh_per_km": eff,
+        })
+    rows.sort(key=lambda r: r["speed_bin_lo_kph"])
+    return rows
 
 
-def summarize_speed_bins(laps: list[pd.DataFrame]) -> pd.DataFrame:
-    all_points = pd.concat(laps, ignore_index=True)
-    valid = all_points[(all_points["dt_s"] > 0) & (all_points["speed_kph"].between(5, 70))].copy()
-    valid = valid[valid["grade_pct"].abs() <= 1.0]
-    if valid.empty:
-        return pd.DataFrame()
-    valid["speed_bin"] = pd.cut(valid["speed_kph"], bins=np.arange(5, 75, 5), right=False)
-    grouped = valid.groupby("speed_bin", observed=True, as_index=False)
-    rows = []
-    for _, df in grouped:
-        distance_m = float(df["dist_m"].sum())
-        energy_wh = float(df["energy_wh"].sum())
-        if distance_m < 150:
-            continue
-        rows.append(
-            {
-                "speed_bin": str(df["speed_bin"].iloc[0]),
-                "avg_speed_kph": float(df["speed_kph"].mean()),
-                "distance_m": distance_m,
-                "energy_wh": energy_wh,
-                "wh_per_km": energy_wh / (distance_m / 1000.0),
-                "avg_power_w": energy_wh * 3600.0 / float(df["dt_s"].sum()),
-            }
-        )
-    return pd.DataFrame(rows).sort_values("avg_speed_kph").reset_index(drop=True)
+# ---------------------------------------------------------------------------
+# Plain-English findings
+# ---------------------------------------------------------------------------
 
+def generate_findings(
+    laps_df: pd.DataFrame,
+    sectors_df: pd.DataFrame,
+    speed_bins_df: pd.DataFrame,
+) -> str:
+    lines = ["=== Strategy Findings ===", ""]
 
-def build_findings(
-    lap_summary: pd.DataFrame, sector_summary: pd.DataFrame, speed_bins: pd.DataFrame
-) -> list[str]:
-    findings = []
-    if lap_summary.empty:
-        return ["No valid laps were summarized."]
+    # Identify "full laps" as those within 90% of median lap distance
+    median_dist = laps_df["distance_m"].median()
+    full = laps_df[laps_df["distance_m"] >= 0.9 * median_dist]
 
-    full_laps = lap_summary[lap_summary["distance_m"] >= lap_summary["distance_m"].median() * 0.9].copy()
-    if len(full_laps) >= 2:
-        best_eff = full_laps.sort_values(["wh_per_km", "avg_speed_kph"], ascending=[True, False]).iloc[0]
-        findings.append(
-            f"Most efficient full lap: lap {int(best_eff['lap'])} at "
-            f"{best_eff['wh_per_km']:.2f} Wh/km and {best_eff['avg_speed_kph']:.1f} km/h."
+    if full.empty:
+        lines.append("Not enough full laps to derive findings.")
+        return "\n".join(lines)
+
+    best_eff = full.loc[full["efficiency_wh_per_km"].idxmin()]
+    fastest = full.loc[full["duration_s"].idxmin()]
+
+    lines.append(
+        f"Most efficient full lap: Lap {int(best_eff['lap'])}  "
+        f"({best_eff['efficiency_wh_per_km']:.2f} Wh/km, "
+        f"{best_eff['duration_s']:.1f}s)"
+    )
+    lines.append(
+        f"Fastest full lap:        Lap {int(fastest['lap'])}  "
+        f"({fastest['duration_s']:.1f}s, "
+        f"{fastest['efficiency_wh_per_km']:.2f} Wh/km)"
+    )
+
+    if int(best_eff["lap"]) == int(fastest["lap"]):
+        lines.append("→ The fastest lap was also the most efficient.")
+    else:
+        lines.append(
+            "→ The fastest and most efficient laps were different — "
+            "there is likely a speed-vs-efficiency trade-off to explore."
         )
 
-        fastest = full_laps.sort_values("avg_speed_kph", ascending=False).iloc[0]
-        findings.append(
-            f"Fastest full lap: lap {int(fastest['lap'])} at {fastest['avg_speed_kph']:.1f} km/h "
-            f"using {fastest['avg_current_a']:.2f} A average current."
-        )
-
-        if int(best_eff["lap"]) == int(fastest["lap"]):
-            findings.append(
-                "The same lap was both fastest and most energy-efficient, which usually points to smoother throttle application rather than simply pushing harder."
-            )
-
-    if not speed_bins.empty:
-        best_bin = speed_bins.sort_values("wh_per_km").iloc[0]
-        worst_bin = speed_bins.sort_values("wh_per_km", ascending=False).iloc[0]
-        findings.append(
-            f"On near-flat sections, the best observed efficiency band was {best_bin['avg_speed_kph']:.1f} km/h "
-            f"at {best_bin['wh_per_km']:.2f} Wh/km."
-        )
-        findings.append(
-            f"The least efficient observed flat-speed band was {worst_bin['avg_speed_kph']:.1f} km/h "
-            f"at {worst_bin['wh_per_km']:.2f} Wh/km."
-        )
-
-    if not sector_summary.empty and len(full_laps) >= 2:
-        compare_laps = full_laps.sort_values("lap")["lap"].tail(2).tolist()
-        sector_pair = sector_summary[sector_summary["lap"].isin(compare_laps)].copy()
-        if sector_pair["lap"].nunique() == 2:
-            pivot = sector_pair.pivot(index="sector", columns="lap", values=["wh_per_km", "avg_speed_kph"])
-            latest, prior = compare_laps[-1], compare_laps[-2]
-            pivot[("delta", "eff_gain")] = pivot[("wh_per_km", latest)] - pivot[("wh_per_km", prior)]
-            pivot[("delta", "speed_gain")] = (
-                pivot[("avg_speed_kph", latest)] - pivot[("avg_speed_kph", prior)]
-            )
-            biggest_eff = pivot.sort_values(("delta", "eff_gain")).iloc[0]
-            biggest_loss = pivot.sort_values(("delta", "eff_gain"), ascending=False).iloc[0]
-            findings.append(
-                f"Compared with lap {prior}, lap {latest} improved most in sector {int(biggest_eff.name)} "
-                f"({biggest_eff[('delta', 'eff_gain')]:.2f} Wh/km change)."
-            )
-            findings.append(
-                f"The main remaining efficiency leak was sector {int(biggest_loss.name)} on lap {latest}, "
-                f"which moved {biggest_loss[('delta', 'eff_gain')]:.2f} Wh/km against lap {prior}."
-            )
-
-    return findings
-
-
-def write_report(
-    prefix: str,
-    lap_summary: pd.DataFrame,
-    sector_summary: pd.DataFrame,
-    speed_bins: pd.DataFrame,
-    findings: list[str],
-) -> tuple[Path, Path, Path]:
-    prefix_path = Path(prefix)
-    lap_path = prefix_path.with_name(prefix_path.name + "_laps.csv")
-    sector_path = prefix_path.with_name(prefix_path.name + "_sectors.csv")
-    speed_path = prefix_path.with_name(prefix_path.name + "_speed_bins.csv")
-    report_path = prefix_path.with_name(prefix_path.name + "_report.txt")
-
-    lap_summary.to_csv(lap_path, index=False)
-    sector_summary.to_csv(sector_path, index=False)
-    speed_bins.to_csv(speed_path, index=False)
-
-    lines = ["Strategy Analysis", "=================", ""]
-    lines.append("Key Findings")
-    for item in findings:
-        lines.append(f"- {item}")
     lines.append("")
-    lines.append("Lap Summary")
-    lines.append(lap_summary.to_string(index=False))
-    if not speed_bins.empty:
-        lines.append("")
-        lines.append("Flat-Section Speed Bins")
-        lines.append(speed_bins.to_string(index=False))
-    report_path.write_text("\n".join(lines), encoding="utf-8")
-    return report_path, lap_path, sector_path
 
+    # Speed bin findings
+    if not speed_bins_df.empty:
+        valid = speed_bins_df.dropna(subset=["efficiency_wh_per_km"])
+        if not valid.empty:
+            best_bin = valid.loc[valid["efficiency_wh_per_km"].idxmin()]
+            worst_bin = valid.loc[valid["efficiency_wh_per_km"].idxmax()]
+            lines.append(
+                f"Flat-section best efficiency:  "
+                f"{best_bin['speed_bin_lo_kph']:.0f}–{best_bin['speed_bin_hi_kph']:.0f} km/h  "
+                f"({best_bin['efficiency_wh_per_km']:.2f} Wh/km)"
+            )
+            lines.append(
+                f"Flat-section worst efficiency: "
+                f"{worst_bin['speed_bin_lo_kph']:.0f}–{worst_bin['speed_bin_hi_kph']:.0f} km/h  "
+                f"({worst_bin['efficiency_wh_per_km']:.2f} Wh/km)"
+            )
+            lines.append("")
+
+    # Sector improvements between the last two full laps
+    full_lap_nums = sorted(full["lap"].tolist())
+    if len(full_lap_nums) >= 2:
+        last_two = full_lap_nums[-2:]
+        prev_lap, last_lap = last_two
+        prev_sec = sectors_df[sectors_df["lap"] == prev_lap].set_index("sector")
+        last_sec = sectors_df[sectors_df["lap"] == last_lap].set_index("sector")
+        common = prev_sec.index.intersection(last_sec.index)
+        if not common.empty:
+            delta = last_sec.loc[common, "efficiency_wh_per_km"] - prev_sec.loc[common, "efficiency_wh_per_km"]
+            if not delta.empty and not delta.isna().all():
+                best_gain = delta.idxmin()
+                worst_regress = delta.idxmax()
+                lines.append(
+                    f"Lap {prev_lap}→{last_lap}: biggest efficiency improvement in sector {best_gain}  "
+                    f"({delta[best_gain]:+.2f} Wh/km)"
+                )
+                if delta[worst_regress] > 0:
+                    lines.append(
+                        f"Lap {prev_lap}→{last_lap}: biggest remaining regression in sector {worst_regress}  "
+                        f"({delta[worst_regress]:+.2f} Wh/km)"
+                    )
+
+    lines.append("")
+    lines.append("=== Lap Summary ===")
+    lines.append(
+        laps_df.to_string(
+            index=False,
+            float_format=lambda x: f"{x:.2f}",
+        )
+    )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main() -> int:
     args = parse_args()
-    laps = build_laps(args)
-    if not laps:
-        raise SystemExit("No laps could be built from the supplied data.")
 
-    lap_summary = summarize_laps(laps)
-    sector_summary = summarize_sectors(laps, args.segments)
-    speed_bins = summarize_speed_bins(laps)
-    findings = build_findings(lap_summary, sector_summary, speed_bins)
-    report_path, lap_path, sector_path = write_report(
-        args.output_prefix, lap_summary, sector_summary, speed_bins, findings
-    )
+    # Ensure output directory exists
+    out_dir = os.path.dirname(args.output_prefix)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
 
-    print("Key findings:")
-    for item in findings:
-        print(f"- {item}")
-    print("")
-    print("Lap summary:")
-    print(lap_summary.to_string(index=False))
-    print("")
-    print(f"Saved report to: {report_path}")
-    print(f"Saved lap summary to: {lap_path}")
-    print(f"Saved sector summary to: {sector_path}")
+    print(f"Reading GPX: {args.gps}")
+    gps_df = read_gpx(args.gps)
+    print(f"Reading telemetry: {args.telemetry}")
+    telem_df = read_telemetry(args.telemetry)
+
+    print("Building laps…")
+    gps_laps, telem_laps, telem_aligned = build_laps(gps_df, telem_df, args)
+
+    lap_summaries = []
+    sector_rows = []
+    all_derived = []
+
+    for idx, (lap_gps, lap_telem) in enumerate(zip(gps_laps, telem_laps), start=1):
+        if lap_gps.empty or lap_telem.empty:
+            print(f"Lap {idx}: skipping (no GPS or telemetry data)")
+            continue
+
+        try:
+            merged = merge_by_time(lap_telem, lap_gps, args.tolerance_sec)
+        except ValueError as exc:
+            print(f"Lap {idx}: skipping — {exc}")
+            continue
+
+        derived = derive_motion_energy(merged)
+        all_derived.append(derived)
+
+        lap_row = build_lap_summary(derived, idx)
+        lap_summaries.append(lap_row)
+
+        for row in build_sector_summary(derived, idx, args.segments):
+            sector_rows.append(row)
+
+        print(
+            f"Lap {idx}: {lap_row['duration_s']:.1f}s, "
+            f"{lap_row['distance_m']:.0f}m, "
+            f"{lap_row['avg_speed_kph']:.1f}km/h, "
+            f"{lap_row['efficiency_wh_per_km']:.2f}Wh/km"
+        )
+
+    if not lap_summaries:
+        print("ERROR: No laps could be processed.")
+        return 1
+
+    laps_df = pd.DataFrame(lap_summaries)
+    sectors_df = pd.DataFrame(sector_rows)
+    speed_bins = build_speed_bins(all_derived)
+    speed_bins_df = pd.DataFrame(speed_bins)
+
+    # Write CSVs
+    laps_csv = args.output_prefix + "_laps.csv"
+    sectors_csv = args.output_prefix + "_sectors.csv"
+    bins_csv = args.output_prefix + "_speed_bins.csv"
+    report_txt = args.output_prefix + "_report.txt"
+
+    laps_df.to_csv(laps_csv, index=False)
+    sectors_df.to_csv(sectors_csv, index=False)
+    speed_bins_df.to_csv(bins_csv, index=False)
+    print(f"Wrote: {laps_csv}, {sectors_csv}, {bins_csv}")
+
+    # Write plain-English report
+    report = generate_findings(laps_df, sectors_df, speed_bins_df)
+    with open(report_txt, "w") as fh:
+        fh.write(report + "\n")
+    print(f"Wrote: {report_txt}")
+    print()
+    print(report)
+
     return 0
 
 
