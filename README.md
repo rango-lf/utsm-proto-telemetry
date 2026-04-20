@@ -1,6 +1,8 @@
-# UTSM Telemetry Dumper
+# UTSM Telemetry Dumper 
 
-Small Python tooling for pulling telemetry off the car, aligning it with a GPX track, drawing lap heatmaps, and generating simple strategy/efficiency reports.
+### CURRENTLY UNDER CONSTRUCTION, mind the mess!!
+
+Small Python tooling for pulling telemetry off the car, aligning it with a GPX track, drawing lap heatmaps, and generating simple strategy/efficiency reports. Holy freaking bingle.
 
 ## What This Project Does
 
@@ -273,7 +275,7 @@ python analyze_strategy.py Utsm.gpx telemetry_20260411_112302.csv --laps 4 --tim
 - Sector analysis is distance-based, not corner-based.
 - The default `start` lap detection assumes a strong launch current spike and a repeatable crossing of the start-line Y band.
 
-## Suggested Next Cleanup
+## Suggested Next Cleanup <-- Currently working on these :3
 
 If you want to keep developing this, the next sensible cleanup would be:
 
