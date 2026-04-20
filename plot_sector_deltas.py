@@ -1,7 +1,6 @@
 """Plot sector-by-sector efficiency deltas across laps.
 
-This is the 'plotting script for sector deltas across laps' suggested in the
-README as the next useful addition to the toolchain.
+This is the 'plotting script for sector deltas across laps'. Bro IDK if this works properly.
 
 Usage
 -----
