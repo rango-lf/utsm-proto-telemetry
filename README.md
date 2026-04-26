@@ -1,6 +1,6 @@
-# UTSM Telemetry Dumper 
+# UTSM Telemetry Dumper (Rango's Version)
 
-### CURRENTLY UNDER CONSTRUCTION, mind the mess!!
+### CURRENTLY UNDER CONSTRUCTION, please mind the mess!!
 
 Small Python tooling for pulling telemetry off the car, aligning it with a GPX track, drawing lap heatmaps, and generating simple strategy/efficiency reports. Holy freaking bingle.
 
@@ -10,7 +10,7 @@ There are really three jobs in this repo:
 
 1. `dumper.py` talks to the serial device and saves a telemetry dump to CSV.
 2. `gps_current_heatmap.py` aligns telemetry to a timestamped GPX track and renders lap heatmaps.
-3. `analyze_strategy.py` reuses the same alignment and lap-splitting logic to turn a run into lap, sector, and speed-efficiency summaries.
+3. `analyze_strategy.py` reuses the same alignment and lap-splitting logic to turn a run into lap, sector, and speed-efficiency summaries in a .csv file.
 
 In practice, the workflow is:
 
@@ -20,6 +20,7 @@ In practice, the workflow is:
 4. Split the run into laps.
 5. Merge GPS motion with telemetry current/voltage.
 6. Summarize energy use and speed by lap and by sector.
+7. Plot lap data onto a bar graph for comparison. 
 
 ## Repo Layout
 
