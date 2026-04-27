@@ -31,6 +31,14 @@ from utsm_telemetry import (
     read_gpx,
     read_telemetry,
 )
+from utsm_telemetry.simulation import (
+    build_full_run_distance,
+    build_strategy_report,
+    build_strategy_samples,
+    build_strategy_segments,
+    fit_empirical_energy_model,
+    optimize_speed_profile,
+)
 
 DEFAULT_GPS = "Utsm-2.gpx"
 DEFAULT_TELEMETRY = os.path.join(
@@ -41,10 +49,10 @@ DEFAULT_OUTPUT = os.path.join("outputs", "afternoon_interactive_dashboard.html")
 
 METRICS = {
     "gpsAccel": {
-        "label": "GPS acceleration",
+        "label": "GPS accel magnitude",
         "unit": "m/s^2",
         "field": "gpsAccel",
-        "source": "gps_longitudinal_accel_m_s2",
+        "source": "gps_longitudinal_accel_abs_m_s2",
         "color": "#2ca02c",
     },
     "imuAccel": {
@@ -61,6 +69,13 @@ METRICS = {
         "source": "speed_kph",
         "color": "#1f77b4",
     },
+    "targetSpeed": {
+        "label": "Strategy target speed",
+        "unit": "km/h",
+        "field": "targetSpeed",
+        "source": "target_speed_kph",
+        "color": "#f97316",
+    },
     "current": {
         "label": "Current",
         "unit": "mA",
@@ -74,6 +89,14 @@ METRICS = {
         "field": "power",
         "source": "power_w",
         "color": "#9467bd",
+    },
+    "runEnergyJ": {
+        "label": "Total energy",
+        "unit": "J",
+        "field": "runEnergyJ",
+        "source": "cum_energy_j",
+        "color": "#b45309",
+        "map_selectable": False,
     },
 }
 
@@ -105,11 +128,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--imu-axis", choices=["ax", "ay", "az"], default="ax")
     parser.add_argument("--imu-axis-sign", type=int, choices=[-1, 1], default=1)
     parser.add_argument("--accel-bias-window-sec", type=float, default=30.0)
-    parser.add_argument("--accel-smooth-window-sec", type=float, default=3.0)
+    parser.add_argument("--accel-smooth-window-sec", type=float, default=8.0)
+    parser.add_argument("--strategy-segments", type=int, default=24)
+    parser.add_argument("--strategy-speed-min-kph", type=float, default=8.0)
+    parser.add_argument("--strategy-speed-max-kph", type=float, default=40.0)
+    parser.add_argument("--strategy-max-delta-kph-per-segment", type=float, default=6.0)
+    parser.add_argument("--strategy-speed-step-kph", type=float, default=1.0)
+    parser.add_argument("--strategy-time-budget-sec", type=float)
+    parser.add_argument("--strategy-lap-time-target-sec", type=float)
     return parser.parse_args()
 
 
-def load_derived_run(args: argparse.Namespace) -> pd.DataFrame:
+def load_derived_run(
+    args: argparse.Namespace,
+) -> tuple[pd.DataFrame, pd.DataFrame, str, float]:
+    """Build one merged run plus the matching optimized strategy payload."""
     gps_df = read_gpx(args.gps)
     telem_df = read_telemetry(args.telemetry)
     gps_laps, telem_laps, _ = build_laps(gps_df, telem_df, args)
@@ -152,7 +185,39 @@ def load_derived_run(args: argparse.Namespace) -> pd.DataFrame:
     df = add_xy(df)
     start_time = pd.to_datetime(df["time"].iloc[0])
     df["elapsed_s"] = (pd.to_datetime(df["time"]) - start_time).dt.total_seconds()
-    return df
+    df["cum_energy_j"] = pd.to_numeric(df["energy_j"], errors="coerce").fillna(0.0).cumsum()
+    df["run_cumdist_m"] = pd.to_numeric(df["dist_m"], errors="coerce").fillna(0.0).cumsum()
+    df = build_full_run_distance(df)
+
+    baseline_time_s = float(pd.to_numeric(df["dt_s"], errors="coerce").fillna(0.0).sum())
+    if args.strategy_time_budget_sec is not None:
+        strategy_time_budget_s = float(args.strategy_time_budget_sec)
+    elif args.strategy_lap_time_target_sec is not None:
+        strategy_time_budget_s = float(args.strategy_lap_time_target_sec * args.laps)
+    else:
+        strategy_time_budget_s = baseline_time_s
+
+    strategy_segments = build_strategy_segments(df, args.strategy_segments)
+    strategy_model = fit_empirical_energy_model(df)
+    strategy_profile = optimize_speed_profile(
+        strategy_segments,
+        strategy_model,
+        time_budget_sec=strategy_time_budget_s,
+        speed_min_kph=args.strategy_speed_min_kph,
+        speed_max_kph=args.strategy_speed_max_kph,
+        max_delta_kph_per_segment=args.strategy_max_delta_kph_per_segment,
+        speed_step_kph=args.strategy_speed_step_kph,
+    )
+    aligned = build_strategy_samples(df, strategy_profile).reset_index(drop=True)
+    strategy_report = build_strategy_report(df, strategy_profile, strategy_time_budget_s)
+    df = df.reset_index(drop=True)
+    df["segment"] = aligned["segment"]
+    df["target_speed_kph"] = aligned["target_speed_kph"]
+    df["strategy_action"] = aligned["strategy_action"]
+    df["pred_power_w"] = aligned["pred_power_w"]
+    df["pred_energy_j"] = aligned["pred_energy_j"]
+    df["pred_cum_energy_j"] = aligned["pred_cum_energy_j"]
+    return df, strategy_profile, strategy_report, strategy_time_budget_s
 
 
 def finite_float(value: Any, digits: int = 3) -> float | None:
@@ -165,7 +230,13 @@ def finite_float(value: Any, digits: int = 3) -> float | None:
     return round(result, digits)
 
 
-def make_payload(df: pd.DataFrame, args: argparse.Namespace) -> dict[str, Any]:
+def make_payload(
+    df: pd.DataFrame,
+    strategy_profile: pd.DataFrame,
+    strategy_report: str,
+    strategy_time_budget_s: float,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
     samples = []
     for row in df.itertuples(index=False):
         samples.append({
@@ -173,19 +244,35 @@ def make_payload(df: pd.DataFrame, args: argparse.Namespace) -> dict[str, Any]:
             "lap": int(row.lap),
             "x": finite_float(row.x, 2),
             "y": finite_float(row.y, 2),
+            "segment": int(row.segment),
             "current": finite_float(row.current_mA, 0),
             "speed": finite_float(row.speed_kph, 2),
-            "gpsAccel": finite_float(row.gps_longitudinal_accel_m_s2, 3),
+            "targetSpeed": finite_float(row.target_speed_kph, 2),
+            "gpsAccel": finite_float(row.gps_longitudinal_accel_abs_m_s2, 3),
             "imuAccel": finite_float(row.imu_forward_dynamic_m_s2, 3),
             "power": finite_float(row.power_w, 2),
+            "runEnergyJ": finite_float(row.cum_energy_j, 2),
+            "predRunEnergyJ": finite_float(row.pred_cum_energy_j, 2),
+            "strategyAction": str(row.strategy_action),
         })
 
     metric_domains = {}
     for key, spec in METRICS.items():
         values = pd.to_numeric(df[spec["source"]], errors="coerce")
+        if key == "speed":
+            values = pd.concat(
+                [values, pd.to_numeric(df["target_speed_kph"], errors="coerce")],
+                ignore_index=True,
+            )
+        elif key == "runEnergyJ":
+            values = pd.concat(
+                [values, pd.to_numeric(df["pred_cum_energy_j"], errors="coerce")],
+                ignore_index=True,
+            )
         metric_domains[key] = domain(
             values,
             robust=key in ("gpsAccel", "imuAccel"),
+            min_zero=key in ("gpsAccel", "runEnergyJ", "targetSpeed"),
         )
 
     x_domain = domain(df["x"])
@@ -209,6 +296,23 @@ def make_payload(df: pd.DataFrame, args: argparse.Namespace) -> dict[str, Any]:
             "power_corr": finite_float(row["power_corr"], 4),
         })
 
+    baseline_energy_j = float(pd.to_numeric(df["energy_j"], errors="coerce").fillna(0.0).sum())
+    predicted_energy_j = float(pd.to_numeric(strategy_profile["pred_energy_j"], errors="coerce").fillna(0.0).sum())
+    delta_j = predicted_energy_j - baseline_energy_j
+    delta_pct = (delta_j / baseline_energy_j * 100.0) if baseline_energy_j > 0 else 0.0
+    strategy_segments = []
+    for row in strategy_profile.itertuples(index=False):
+        strategy_segments.append({
+            "segment": int(row.segment),
+            "dist_start_m": finite_float(row.dist_start_m, 2),
+            "dist_end_m": finite_float(row.dist_end_m, 2),
+            "target_speed_kph": finite_float(row.target_speed_kph, 2),
+            "entry_speed_kph": finite_float(row.entry_speed_kph, 2),
+            "speed_delta_kph": finite_float(row.speed_delta_kph, 2),
+            "pred_energy_j": finite_float(row.pred_energy_j, 2),
+            "action": str(row.action),
+        })
+
     return {
         "meta": {
             "gps": args.gps,
@@ -224,6 +328,15 @@ def make_payload(df: pd.DataFrame, args: argparse.Namespace) -> dict[str, Any]:
                 "smooth_window_s": args.accel_smooth_window_sec,
             },
         },
+        "strategy": {
+            "time_budget_s": finite_float(strategy_time_budget_s, 2),
+            "baseline_energy_j": finite_float(baseline_energy_j, 2),
+            "predicted_energy_j": finite_float(predicted_energy_j, 2),
+            "delta_energy_j": finite_float(delta_j, 2),
+            "delta_energy_pct": finite_float(delta_pct, 2),
+            "segments": strategy_segments,
+            "report": strategy_report,
+        },
         "accel_diagnostics": accel_diagnostics,
         "samples": samples,
         "laps": lap_ranges,
@@ -238,6 +351,7 @@ def make_payload(df: pd.DataFrame, args: argparse.Namespace) -> dict[str, Any]:
                 "unit": spec["unit"],
                 "field": spec["field"],
                 "color": spec["color"],
+                "map_selectable": spec.get("map_selectable", True),
             }
             for key, spec in METRICS.items()
         },
@@ -248,6 +362,7 @@ def domain(
     values: pd.Series,
     pad_fraction: float = 0.06,
     robust: bool = False,
+    min_zero: bool = False,
 ) -> list[float]:
     finite = pd.to_numeric(values, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
     if finite.empty:
@@ -260,9 +375,11 @@ def domain(
         hi = float(finite.max())
     if math.isclose(lo, hi):
         pad = max(abs(lo) * 0.05, 1.0)
-        return [round(lo - pad, 3), round(hi + pad, 3)]
+        lower = 0.0 if min_zero else lo - pad
+        return [round(lower, 3), round(hi + pad, 3)]
     pad = (hi - lo) * pad_fraction
-    return [round(lo - pad, 3), round(hi + pad, 3)]
+    lower = 0.0 if min_zero else lo - pad
+    return [round(lower, 3), round(hi + pad, 3)]
 
 
 def build_html(payload: dict[str, Any]) -> str:
@@ -338,7 +455,7 @@ def build_html(payload: dict[str, Any]) -> str:
     }}
     .charts {{
       display: grid;
-      grid-template-rows: repeat(5, minmax(112px, 1fr));
+      grid-template-rows: repeat(6, minmax(100px, 1fr));
       gap: 10px;
     }}
     .chart {{
@@ -346,7 +463,7 @@ def build_html(payload: dict[str, Any]) -> str:
     }}
     .controls {{
       display: grid;
-      grid-template-columns: auto minmax(300px, 1fr) auto auto auto auto;
+      grid-template-columns: auto minmax(240px, 1fr) auto auto auto auto auto;
       gap: 12px;
       align-items: center;
       margin-top: 14px;
@@ -374,7 +491,7 @@ def build_html(payload: dict[str, Any]) -> str:
     }}
     .readout {{
       display: grid;
-      grid-template-columns: repeat(5, 1fr);
+      grid-template-columns: repeat(6, 1fr);
       gap: 8px;
       margin-top: 12px;
     }}
@@ -434,6 +551,7 @@ def build_html(payload: dict[str, Any]) -> str:
           <svg id="trackSvg" viewBox="0 0 720 780" role="img" aria-label="Track map">
             <g id="mapGrid"></g>
             <path id="fullTrack" fill="none" stroke="#d0d5dc" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"></path>
+            <g id="strategyLayer"></g>
             <g id="trailLayer"></g>
             <g id="lapBoundaryLayer"></g>
             <circle id="lapStartMarker" r="7" fill="#3ecf59" stroke="#ffffff" stroke-width="2"></circle>
@@ -452,6 +570,9 @@ def build_html(payload: dict[str, Any]) -> str:
           <label>Metric
             <select id="metricSelect"></select>
           </label>
+          <label>
+            <input id="showStrategy" type="checkbox" checked> Strategy
+          </label>
           <label>Speed
             <select id="playSpeed">
               <option value="0.5">0.5x</option>
@@ -468,6 +589,7 @@ def build_html(payload: dict[str, Any]) -> str:
         </div>
         <div class="readout">
           <div class="stat"><span>Lap</span><strong id="lapValue"></strong></div>
+          <div class="stat"><span>Strategy</span><strong id="strategyValue"></strong></div>
           <div class="stat"><span>Speed</span><strong id="speedValue"></strong></div>
           <div class="stat"><span>Current</span><strong id="currentValue"></strong></div>
           <div class="stat"><span>GPS accel</span><strong id="gpsAccelValue"></strong></div>
@@ -488,8 +610,14 @@ def build_html(payload: dict[str, Any]) -> str:
     const CHART_PAD = {{ left: 58, right: 12, top: 14, bottom: 28 }};
     const samples = DATA.samples;
     const metricSpecs = DATA.metrics;
-    const metricKeys = Object.keys(metricSpecs);
-    const chartKeys = ["current", "speed", "gpsAccel", "imuAccel", "power"];
+    const metricKeys = Object.keys(metricSpecs).filter(
+      key => metricSpecs[key].map_selectable !== false
+    );
+    const chartKeys = ["current", "speed", "gpsAccel", "imuAccel", "power", "runEnergyJ"];
+    const strategyChartFields = {{
+      speed: {{ field: "targetSpeed", color: "#f97316" }},
+      runEnergyJ: {{ field: "predRunEnergyJ", color: "#f97316" }}
+    }};
     const state = {{
       index: 0,
       metric: "gpsAccel",
@@ -501,6 +629,7 @@ def build_html(payload: dict[str, Any]) -> str:
       metaText: document.getElementById("metaText"),
       trackSvg: document.getElementById("trackSvg"),
       fullTrack: document.getElementById("fullTrack"),
+      strategyLayer: document.getElementById("strategyLayer"),
       trailLayer: document.getElementById("trailLayer"),
       lapBoundaryLayer: document.getElementById("lapBoundaryLayer"),
       lapStartMarker: document.getElementById("lapStartMarker"),
@@ -508,11 +637,13 @@ def build_html(payload: dict[str, Any]) -> str:
       mapReadout: document.getElementById("mapReadout"),
       timeSlider: document.getElementById("timeSlider"),
       metricSelect: document.getElementById("metricSelect"),
+      showStrategy: document.getElementById("showStrategy"),
       playButton: document.getElementById("playButton"),
       playSpeed: document.getElementById("playSpeed"),
       showBoundaries: document.getElementById("showBoundaries"),
       timeText: document.getElementById("timeText"),
       lapValue: document.getElementById("lapValue"),
+      strategyValue: document.getElementById("strategyValue"),
       speedValue: document.getElementById("speedValue"),
       currentValue: document.getElementById("currentValue"),
       gpsAccelValue: document.getElementById("gpsAccelValue"),
@@ -626,6 +757,22 @@ def build_html(payload: dict[str, Any]) -> str:
       }}).join("");
     }}
 
+    function drawStrategyLayer(index) {{
+      if (!el.showStrategy.checked) {{
+        el.strategyLayer.innerHTML = "";
+        return;
+      }}
+      const range = currentLapRange(index);
+      let markup = "";
+      for (let i = range.start + 1; i <= range.end; i++) {{
+        const a = samples[i - 1];
+        const b = samples[i];
+        const color = colorForMetric(b.targetSpeed, "targetSpeed");
+        markup += `<line x1="${{xMap(a.x).toFixed(1)}}" y1="${{yMap(a.y).toFixed(1)}}" x2="${{xMap(b.x).toFixed(1)}}" y2="${{yMap(b.y).toFixed(1)}}" stroke="${{color}}" stroke-width="3" stroke-dasharray="7 6" stroke-linecap="round" opacity="0.9"/>`;
+      }}
+      el.strategyLayer.innerHTML = markup;
+    }}
+
     function drawTrail(index) {{
       const range = currentLapRange(index);
       const start = range.start;
@@ -656,6 +803,8 @@ def build_html(payload: dict[str, Any]) -> str:
         <text x="8" y="18" class="axis-label">${{spec.label}} (${{spec.unit}})</text>
         <path class="full-line" fill="none" stroke="#d2d7de" stroke-width="2"></path>
         <path class="progress-line" fill="none" stroke="${{spec.color}}" stroke-width="2.4"></path>
+        <path class="strategy-full-line" fill="none" stroke="#fdba74" stroke-width="1.8" stroke-dasharray="6 5"></path>
+        <path class="strategy-progress-line" fill="none" stroke="#f97316" stroke-width="2.4" stroke-dasharray="6 5"></path>
         <line class="cursor-line" y1="${{CHART_PAD.top}}" y2="${{CHART_H - CHART_PAD.bottom}}" stroke="#111827" stroke-width="1"></line>
         <text class="tick-label min-label" x="${{CHART_PAD.left}}" y="${{CHART_H - 8}}"></text>
         <text class="tick-label max-label" x="${{CHART_PAD.left}}" y="11"></text>
@@ -667,6 +816,16 @@ def build_html(payload: dict[str, Any]) -> str:
       const [lo, hi] = DATA.domains.metrics[key];
       svg.querySelector(".min-label").textContent = lo.toFixed(1);
       svg.querySelector(".max-label").textContent = hi.toFixed(1);
+      const strategySpec = strategyChartFields[key];
+      if (strategySpec) {{
+        svg.querySelector(".strategy-full-line").setAttribute(
+          "d",
+          linePath(samples, s => chartX(s.t), s => chartY(s[strategySpec.field], key))
+        );
+      }} else {{
+        svg.querySelector(".strategy-full-line").setAttribute("d", "");
+        svg.querySelector(".strategy-progress-line").setAttribute("d", "");
+      }}
       el.charts.appendChild(svg);
     }}
 
@@ -677,10 +836,26 @@ def build_html(payload: dict[str, Any]) -> str:
       document.querySelectorAll(".chart").forEach(svg => {{
         const key = svg.dataset.key;
         const spec = metricSpecs[key];
+        const rows = key === "runEnergyJ" ? samples.slice(0, index + 1) : lapRows;
         svg.querySelector(".progress-line").setAttribute(
           "d",
-          linePath(lapRows, s => chartX(s.t), s => chartY(s[spec.field], key))
+          linePath(rows, s => chartX(s.t), s => chartY(s[spec.field], key))
         );
+        const strategySpec = strategyChartFields[key];
+        const strategyLine = svg.querySelector(".strategy-progress-line");
+        const strategyFull = svg.querySelector(".strategy-full-line");
+        if (strategySpec && el.showStrategy.checked) {{
+          strategyLine.setAttribute(
+            "d",
+            linePath(rows, s => chartX(s.t), s => chartY(s[strategySpec.field], key))
+          );
+          strategyLine.style.display = "";
+          strategyFull.style.display = "";
+        }} else {{
+          strategyLine.setAttribute("d", "");
+          strategyLine.style.display = "none";
+          strategyFull.style.display = strategySpec ? "none" : "";
+        }}
         const x = chartX(row.t);
         const cursor = svg.querySelector(".cursor-line");
         cursor.setAttribute("x1", x);
@@ -703,12 +878,14 @@ def build_html(payload: dict[str, Any]) -> str:
       el.carMarker.setAttribute("cy", yMap(row.y));
       el.lapStartMarker.setAttribute("cx", xMap(lapStart.x));
       el.lapStartMarker.setAttribute("cy", yMap(lapStart.y));
+      drawStrategyLayer(state.index);
       drawTrail(state.index);
       updateCharts(state.index);
       drawBoundaries();
       el.timeText.textContent = `t=${{row.t.toFixed(1)}}s / ${{DATA.meta.duration_s.toFixed(1)}}s`;
-      el.mapReadout.textContent = `t=${{row.t.toFixed(1)}}s  lap=${{row.lap}}  speed=${{row.speed.toFixed(1)}} km/h  current=${{row.current.toFixed(0)}} mA  GPS accel=${{row.gpsAccel.toFixed(2)}} m/s^2  MPU accel=${{row.imuAccel.toFixed(2)}} m/s^2`;
+      el.mapReadout.textContent = `t=${{row.t.toFixed(1)}}s  lap=${{row.lap}}  seg=${{row.segment}}  speed=${{row.speed.toFixed(1)}} km/h  target=${{row.targetSpeed.toFixed(1)}} km/h  action=${{row.strategyAction}}  current=${{row.current.toFixed(0)}} mA`;
       el.lapValue.textContent = String(row.lap);
+      el.strategyValue.textContent = `${{row.strategyAction}} @ ${{row.targetSpeed.toFixed(1)}} km/h`;
       el.speedValue.textContent = format(row.speed, 1, " km/h");
       el.currentValue.textContent = format(row.current, 0, " mA");
       el.gpsAccelValue.textContent = format(row.gpsAccel, 2, " m/s^2");
@@ -737,7 +914,7 @@ def build_html(payload: dict[str, Any]) -> str:
 
     function init() {{
       const accelMeta = DATA.meta.accel;
-      el.metaText.textContent = `${{DATA.meta.sample_count}} samples | ${{DATA.meta.duration_s.toFixed(1)}}s | MPU ${{accelMeta.imu_axis}} x ${{accelMeta.imu_axis_sign}} | scale ${{accelMeta.scale}}`;
+      el.metaText.textContent = `${{DATA.meta.sample_count}} samples | ${{DATA.meta.duration_s.toFixed(1)}}s | strategy ${{DATA.strategy.delta_energy_pct.toFixed(2)}}% energy | MPU ${{accelMeta.imu_axis}} x ${{accelMeta.imu_axis_sign}} | scale ${{accelMeta.scale}}`;
       el.timeSlider.max = DATA.meta.duration_s;
       for (const key of metricKeys) {{
         const option = document.createElement("option");
@@ -754,6 +931,7 @@ def build_html(payload: dict[str, Any]) -> str:
         state.metric = event.target.value;
         update(state.index);
       }});
+      el.showStrategy.addEventListener("change", () => update(state.index));
       el.showBoundaries.addEventListener("change", () => drawBoundaries());
       el.playButton.addEventListener("click", () => {{
         state.playing = !state.playing;
@@ -773,8 +951,8 @@ def build_html(payload: dict[str, Any]) -> str:
 
 def main() -> int:
     args = parse_args()
-    df = load_derived_run(args)
-    payload = make_payload(df, args)
+    df, strategy_profile, strategy_report, strategy_time_budget_s = load_derived_run(args)
+    payload = make_payload(df, strategy_profile, strategy_report, strategy_time_budget_s, args)
     html = build_html(payload)
 
     out_dir = os.path.dirname(args.output)

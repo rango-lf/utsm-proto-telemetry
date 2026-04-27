@@ -31,6 +31,15 @@ from .core import (
     compute_accel_candidate_scores,
     derive_motion_energy,
 )
+from .simulation import (
+    build_full_run_distance,
+    build_strategy_segments,
+    fit_empirical_energy_model,
+    predict_power_w,
+    optimize_speed_profile,
+    build_strategy_samples,
+    build_strategy_report,
+)
 
 __all__ = [
     "NAMESPACE",
@@ -57,4 +66,11 @@ __all__ = [
     "add_gps_acceleration_features",
     "compute_accel_candidate_scores",
     "derive_motion_energy",
+    "build_full_run_distance",
+    "build_strategy_segments",
+    "fit_empirical_energy_model",
+    "predict_power_w",
+    "optimize_speed_profile",
+    "build_strategy_samples",
+    "build_strategy_report",
 ]

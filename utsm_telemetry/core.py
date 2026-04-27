@@ -658,15 +658,52 @@ def add_gps_acceleration_features(
     smooth_window_s: float = 3.0,
 ) -> pd.DataFrame:
     df = df.copy()
-    speed = pd.to_numeric(df["speed_m_s"], errors="coerce")
-    dt_s = pd.to_numeric(df["dt_s"], errors="coerce").replace(0, np.nan)
-    raw = speed.diff() / dt_s
-    df["gps_longitudinal_accel_raw_m_s2"] = raw.replace([np.inf, -np.inf], np.nan)
-    smooth_window = _window_samples(df, smooth_window_s)
-    df["gps_longitudinal_accel_m_s2"] = (
-        df["gps_longitudinal_accel_raw_m_s2"]
-        .rolling(window=smooth_window, min_periods=1, center=True)
-        .median()
+    if {"gps_time", "gps_speed_m_s"}.issubset(df.columns):
+        gps_motion = (
+            df[["gps_time", "gps_speed_m_s"]]
+            .dropna()
+            .drop_duplicates(subset=["gps_time"])
+            .sort_values("gps_time")
+            .reset_index(drop=True)
+        )
+        gps_times = pd.to_datetime(gps_motion["gps_time"])
+        gps_dt_s = gps_times.diff().dt.total_seconds().replace(0, np.nan)
+        gps_speed = pd.to_numeric(gps_motion["gps_speed_m_s"], errors="coerce")
+        raw = (gps_speed.diff() / gps_dt_s).replace([np.inf, -np.inf], np.nan)
+        positive_dt = gps_dt_s[gps_dt_s > 0]
+        if positive_dt.empty or smooth_window_s <= 0:
+            smooth_window = 1
+        else:
+            smooth_window = max(1, int(round(smooth_window_s / float(positive_dt.median()))))
+        smooth = (
+            raw.rolling(window=smooth_window, min_periods=1, center=True)
+            .median()
+            .fillna(0.0)
+        )
+        gps_motion["gps_longitudinal_accel_raw_m_s2"] = raw.fillna(0.0)
+        gps_motion["gps_longitudinal_accel_m_s2"] = smooth
+        accel_lookup = gps_motion.set_index("gps_time")
+        df["gps_longitudinal_accel_raw_m_s2"] = (
+            df["gps_time"].map(accel_lookup["gps_longitudinal_accel_raw_m_s2"]).fillna(0.0)
+        )
+        df["gps_longitudinal_accel_m_s2"] = (
+            df["gps_time"].map(accel_lookup["gps_longitudinal_accel_m_s2"]).fillna(0.0)
+        )
+    else:
+        speed = pd.to_numeric(df["speed_m_s"], errors="coerce")
+        dt_s = pd.to_numeric(df["dt_s"], errors="coerce").replace(0, np.nan)
+        raw = speed.diff() / dt_s
+        df["gps_longitudinal_accel_raw_m_s2"] = raw.replace([np.inf, -np.inf], np.nan)
+        smooth_window = _window_samples(df, smooth_window_s)
+        df["gps_longitudinal_accel_m_s2"] = (
+            df["gps_longitudinal_accel_raw_m_s2"]
+            .rolling(window=smooth_window, min_periods=1, center=True)
+            .median()
+            .fillna(0.0)
+        )
+    df["gps_longitudinal_accel_abs_m_s2"] = (
+        pd.to_numeric(df["gps_longitudinal_accel_m_s2"], errors="coerce")
+        .abs()
         .fillna(0.0)
     )
     return df
@@ -707,7 +744,8 @@ def derive_motion_energy(
     accel_smooth_window_sec: float = 3.0,
 ) -> pd.DataFrame:
     """Add dt_s, dist_m, elev_diff_m, speed_m_s, speed_kph, grade_pct,
-    power_w, energy_wh, and cumdist_m columns to a merged lap DataFrame.
+    power_w, energy_wh, energy_j, cum_energy_j, and cumdist_m columns to a
+    merged lap DataFrame.
 
     Expects columns: time, lat, lon, elev, current_mA, voltage_mV.
     """
@@ -764,6 +802,8 @@ def derive_motion_energy(
     # Power and energy
     df["power_w"] = (df["current_mA"].abs() / 1000.0) * (df["voltage_mV"] / 1000.0)
     df["energy_wh"] = df["power_w"] * df["dt_s"] / 3600.0
+    df["energy_j"] = df["power_w"] * df["dt_s"]
+    df["cum_energy_j"] = df["energy_j"].cumsum()
 
     # Cumulative distance through the lap
     df["cumdist_m"] = df["dist_m"].cumsum()

@@ -15,6 +15,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 import pandas as pd
+from argparse import Namespace
+from build_interactive_dashboard import make_payload
 from utsm_telemetry.core import (
     add_xy,
     compute_distance,
@@ -27,6 +29,13 @@ from utsm_telemetry.core import (
     find_lap_boundaries_by_start_gate,
     merge_by_time,
     read_gpx,
+)
+from utsm_telemetry.simulation import (
+    build_strategy_report,
+    build_strategy_segments,
+    build_strategy_samples,
+    fit_empirical_energy_model,
+    optimize_speed_profile,
 )
 
 
@@ -252,10 +261,13 @@ class TestDeriveMotionEnergy(unittest.TestCase):
             "speed_kph",
             "power_w",
             "energy_wh",
+            "energy_j",
+            "cum_energy_j",
             "cumdist_m",
             "accel_total_g",
             "accel_total_m_s2",
             "gps_longitudinal_accel_m_s2",
+            "gps_longitudinal_accel_abs_m_s2",
             "imu_ax_m_s2",
             "imu_total_g",
             "imu_forward_dynamic_m_s2",
@@ -271,6 +283,7 @@ class TestDeriveMotionEnergy(unittest.TestCase):
         merged = merge_by_time(aligned, gps, tolerance_sec=2.0)
         derived = derive_motion_energy(merged)
         self.assertTrue((derived["energy_wh"] >= 0).all())
+        self.assertTrue((derived["energy_j"] >= 0).all())
 
     def test_cumdist_monotone(self):
         gps = _make_gps(20)
@@ -280,6 +293,24 @@ class TestDeriveMotionEnergy(unittest.TestCase):
         derived = derive_motion_energy(merged)
         diffs = derived["cumdist_m"].diff().dropna()
         self.assertTrue((diffs >= 0).all())
+
+    def test_energy_j_matches_power_times_dt(self):
+        gps = _make_gps(6)
+        telem = _make_telem(6)
+        aligned = align_telemetry(telem, gps, None, 0.0)
+        merged = merge_by_time(aligned, gps, tolerance_sec=2.0)
+        derived = derive_motion_energy(merged)
+        expected = derived["power_w"] * derived["dt_s"]
+        np.testing.assert_allclose(derived["energy_j"], expected)
+
+    def test_cum_energy_j_monotone(self):
+        gps = _make_gps(8)
+        telem = _make_telem(8)
+        aligned = align_telemetry(telem, gps, None, 0.0)
+        merged = merge_by_time(aligned, gps, tolerance_sec=2.0)
+        derived = derive_motion_energy(merged)
+        diffs = derived["cum_energy_j"].diff().fillna(0.0)
+        self.assertTrue((diffs >= -1e-12).all())
 
     def test_gps_acceleration_from_speed_derivative(self):
         gps = _make_gps(4)
@@ -294,8 +325,30 @@ class TestDeriveMotionEnergy(unittest.TestCase):
             accel_smooth_window_sec=0.0,
         )
         self.assertIn("gps_longitudinal_accel_m_s2", derived.columns)
+        self.assertIn("gps_longitudinal_accel_abs_m_s2", derived.columns)
         self.assertAlmostEqual(derived["gps_longitudinal_accel_m_s2"].iloc[1], 1.0)
         self.assertAlmostEqual(derived["gps_longitudinal_accel_m_s2"].iloc[2], 2.0)
+        self.assertAlmostEqual(derived["gps_longitudinal_accel_abs_m_s2"].iloc[2], 2.0)
+
+    def test_gps_acceleration_uses_gps_clock_when_available(self):
+        gps = _make_gps(4)
+        telem = _make_telem(7)
+        aligned = align_telemetry(telem, gps, None, 0.0)
+        merged = merge_by_time(aligned, gps, tolerance_sec=1.0)
+        merged["gps_speed_m_s"] = merged["gps_time"].map({
+            gps["time"].iloc[0]: 0.0,
+            gps["time"].iloc[1]: 1.0,
+            gps["time"].iloc[2]: 3.0,
+            gps["time"].iloc[3]: 6.0,
+        })
+        derived = derive_motion_energy(
+            merged,
+            accel_smooth_window_sec=0.0,
+        )
+        by_gps_time = derived.groupby("gps_time")["gps_longitudinal_accel_m_s2"].first()
+        self.assertAlmostEqual(by_gps_time.iloc[1], 1.0)
+        self.assertAlmostEqual(by_gps_time.iloc[2], 2.0)
+        self.assertAlmostEqual(by_gps_time.iloc[3], 3.0)
 
 
 class TestAccelerationFeatures(unittest.TestCase):
@@ -365,6 +418,133 @@ class TestAccelerationFeatures(unittest.TestCase):
         telem = _make_telem(3)
         with self.assertRaises(ValueError):
             derive_acceleration_features(telem, forward_axis="bad_axis")
+
+
+class TestSimulation(unittest.TestCase):
+    def test_optimizer_prefers_sensible_flat_speed_profile(self):
+        rows = []
+        run_dist = 0.0
+        run_energy = 0.0
+        for i in range(24):
+            speed = 12.0 + (i % 4) * 4.0
+            dt_s = 1.0
+            dist_m = speed / 3.6 * dt_s
+            power_w = 20.0 + 2.0 * speed + 0.4 * (speed ** 2)
+            energy_j = power_w * dt_s
+            run_dist += dist_m
+            run_energy += energy_j
+            rows.append({
+                "time": pd.Timestamp("2026-04-11T12:00:00Z") + pd.Timedelta(seconds=i),
+                "dt_s": dt_s,
+                "dist_m": dist_m,
+                "run_cumdist_m": run_dist,
+                "grade_pct": 0.0,
+                "speed_kph": speed,
+                "gps_longitudinal_accel_m_s2": 0.0,
+                "power_w": power_w,
+                "energy_j": energy_j,
+                "cum_energy_j": run_energy,
+            })
+        df = pd.DataFrame(rows)
+        model = fit_empirical_energy_model(df)
+        segments = build_strategy_segments(df, segments=6)
+        profile = optimize_speed_profile(
+            segments,
+            model,
+            time_budget_sec=float(segments["baseline_time_s"].sum() * 1.2),
+            speed_min_kph=10.0,
+            speed_max_kph=30.0,
+            max_delta_kph_per_segment=4.0,
+            speed_step_kph=2.0,
+        )
+        self.assertTrue((profile["target_speed_kph"] >= 10.0).all())
+        self.assertTrue((profile["target_speed_kph"] <= 30.0).all())
+        self.assertTrue((profile["speed_delta_kph"].abs() <= 4.0 + 1e-9).all())
+        self.assertLess(profile["pred_energy_j"].sum(), segments["baseline_energy_j"].sum())
+
+    def test_strategy_samples_and_report(self):
+        df = pd.DataFrame({
+            "time": pd.date_range("2026-04-11T12:00:00Z", periods=4, freq="1s"),
+            "dt_s": [1.0, 1.0, 1.0, 1.0],
+            "dist_m": [5.0, 5.0, 5.0, 5.0],
+            "run_cumdist_m": [5.0, 10.0, 15.0, 20.0],
+            "grade_pct": [0.0, 0.0, 0.0, 0.0],
+            "speed_kph": [18.0, 18.0, 20.0, 20.0],
+            "gps_longitudinal_accel_m_s2": [0.0, 0.0, 0.1, 0.0],
+            "power_w": [100.0, 100.0, 120.0, 120.0],
+            "energy_j": [100.0, 100.0, 120.0, 120.0],
+            "cum_energy_j": [100.0, 200.0, 320.0, 440.0],
+        })
+        profile = pd.DataFrame({
+            "segment": [1, 2],
+            "dist_start_m": [0.0, 10.0],
+            "dist_end_m": [10.0, 20.0],
+            "length_m": [10.0, 10.0],
+            "target_speed_kph": [18.0, 16.0],
+            "entry_speed_kph": [18.0, 18.0],
+            "speed_delta_kph": [0.0, -2.0],
+            "action": ["hold", "coast"],
+            "pred_power_w": [100.0, 90.0],
+            "segment_time_s": [2.0, 2.25],
+            "pred_energy_j": [200.0, 202.5],
+        })
+        samples = build_strategy_samples(df, profile)
+        report = build_strategy_report(df, profile, time_budget_sec=5.0)
+        self.assertIn("pred_cum_energy_j", samples.columns)
+        self.assertIn("Suggested acceleration segments:", report)
+
+    def test_dashboard_payload_includes_strategy_overlay_fields(self):
+        df = pd.DataFrame({
+            "time": pd.date_range("2026-04-11T12:00:00Z", periods=4, freq="1s"),
+            "lap": [1, 1, 1, 1],
+            "elapsed_s": [0.0, 1.0, 2.0, 3.0],
+            "x": [0.0, 1.0, 2.0, 3.0],
+            "y": [0.0, 0.0, 0.0, 0.0],
+            "segment": [1, 1, 2, 2],
+            "current_mA": [100.0, 110.0, 120.0, 130.0],
+            "speed_kph": [18.0, 20.0, 22.0, 24.0],
+            "target_speed_kph": [19.0, 19.0, 21.0, 21.0],
+            "gps_longitudinal_accel_abs_m_s2": [0.1, 0.2, 0.1, 0.2],
+            "imu_forward_dynamic_m_s2": [0.05, 0.04, 0.06, 0.03],
+            "power_w": [100.0, 110.0, 120.0, 130.0],
+            "energy_j": [100.0, 110.0, 120.0, 130.0],
+            "cum_energy_j": [100.0, 210.0, 330.0, 460.0],
+            "pred_cum_energy_j": [95.0, 200.0, 310.0, 430.0],
+            "strategy_action": ["hold", "hold", "accelerate", "accelerate"],
+        })
+        strategy_profile = pd.DataFrame({
+            "segment": [1, 2],
+            "dist_start_m": [0.0, 10.0],
+            "dist_end_m": [10.0, 20.0],
+            "target_speed_kph": [19.0, 21.0],
+            "entry_speed_kph": [18.0, 19.0],
+            "speed_delta_kph": [1.0, 2.0],
+            "pred_energy_j": [200.0, 230.0],
+            "action": ["accelerate", "accelerate"],
+        })
+        args = Namespace(
+            gps="Utsm-2.gpx",
+            telemetry="telemetry.csv",
+            forward_axis="ax",
+            accel_scale=1000.0,
+            imu_axis="ax",
+            imu_axis_sign=1,
+            accel_bias_window_sec=30.0,
+            accel_smooth_window_sec=8.0,
+        )
+        payload = make_payload(
+            df,
+            strategy_profile,
+            "=== Speed Strategy Report ===",
+            4.0,
+            args,
+        )
+        self.assertIn("targetSpeed", payload["metrics"])
+        self.assertIn("strategy", payload)
+        self.assertEqual(payload["samples"][0]["targetSpeed"], 19.0)
+        self.assertEqual(payload["samples"][0]["predRunEnergyJ"], 95.0)
+        self.assertEqual(payload["samples"][2]["strategyAction"], "accelerate")
+        self.assertEqual(len(payload["strategy"]["segments"]), 2)
 
 
 if __name__ == "__main__":

@@ -7,7 +7,7 @@ The current analysis path is centered on:
 1. `dumper.py` for serial telemetry capture.
 2. `utsm_telemetry/` for shared parsing, alignment, lap detection, motion, energy, and acceleration helpers.
 3. `analyze_strategy.py` for lap, sector, speed-bin, and strategy reports.
-4. `build_interactive_dashboard.py` for the fast local HTML replay dashboard.
+4. `build_interactive_dashboard.py` for the fast local HTML replay dashboard and strategy overlay.
 
 Generated artifacts are reproducible and ignored by Git. Regenerate reports and dashboards into `outputs/` when needed.
 
@@ -59,15 +59,30 @@ Build the dashboard:
 python build_interactive_dashboard.py --laps 3 --output outputs\afternoon_interactive_dashboard.html
 ```
 
+Useful strategy knobs:
+
+```powershell
+python build_interactive_dashboard.py --laps 3 --strategy-segments 24 --strategy-speed-min-kph 8 --strategy-speed-max-kph 40 --strategy-max-delta-kph-per-segment 6 --output outputs\afternoon_interactive_dashboard.html
+```
+
 Open `outputs\afternoon_interactive_dashboard.html` in a browser. It is a self-contained HTML file with:
 
 - one manual time slider
 - play/pause replay
 - full-course gray reference trace
 - current-lap colored trail
-- synchronized current, speed, GPS acceleration, MPU dynamic acceleration, and power charts
+- synchronized current, speed, GPS acceleration, MPU dynamic acceleration, power, and cumulative total-energy charts
 - color selector for track overlay metrics
+- strategy target-speed overlay on the map plus speed/energy comparison overlays
 - optional lap-boundary debug markers
+
+The strategy layer uses the same optimized profile as `simulate_speed_strategy.py`. In the dashboard:
+
+- `Strategy` toggle shows or hides the optimized target-speed overlay
+- `Strategy target speed` can be selected as the map coloring metric
+- the speed chart overlays actual speed against optimized target speed
+- the total-energy chart overlays actual cumulative joules against predicted cumulative joules
+- the live readout shows current segment, target speed, and suggested action
 
 Acceleration is split into two separate channels:
 
@@ -75,6 +90,8 @@ Acceleration is split into two separate channels:
 - `MPU dynamic acceleration`: MPU-6050 axis data scaled as milli-g, bias/gravity corrected with a rolling median, and kept as a diagnostic vibration/response channel.
 
 The dashboard payload also includes MPU axis/sign diagnostic correlations for `ax`, `-ax`, `ay`, `-ay`, `az`, and `-az`.
+
+The total-energy chart is cumulative run joules versus elapsed time. It spans the whole run and does not reset at lap boundaries.
 
 ## Strategy Analysis
 
@@ -101,6 +118,24 @@ The analysis computes:
 - GPS acceleration and MPU dynamic acceleration
 - equal-distance sector summaries
 - flat-road speed efficiency bins
+
+## Speed Strategy Simulation
+
+Run the first empirical optimizer:
+
+```powershell
+python simulate_speed_strategy.py Utsm-2.gpx telemetry_dumps\telemetry_20260411_122713.csv --laps 3 --split-method start --segments 24 --output-prefix outputs\speed_strategy
+```
+
+This writes:
+
+- `PREFIX_strategy_profile.csv`
+- `PREFIX_strategy_samples.csv`
+- `PREFIX_strategy_report.txt`
+
+The dashboard generator runs the same optimizer internally so the HTML stays in sync with the standalone strategy report.
+
+The first version does not use a neural model. It fits an empirical power model from historical samples and then chooses a target speed profile by distance while staying within a time budget and per-segment speed-change limits.
 
 For the corrected afternoon run, the current reference result is 3 complete laps. Lap 2 is the most efficient full lap, while lap 3 is the fastest full lap.
 
@@ -135,6 +170,7 @@ Run smoke tests and regenerate the afternoon demo:
 python tests\test_smoke.py
 python build_interactive_dashboard.py --laps 3 --output outputs\afternoon_interactive_dashboard.html
 python analyze_strategy.py Utsm-2.gpx telemetry_dumps\telemetry_20260411_122713.csv --laps 3 --split-method start --output-prefix outputs\afternoon_clean_demo
+python simulate_speed_strategy.py Utsm-2.gpx telemetry_dumps\telemetry_20260411_122713.csv --laps 3 --split-method start --segments 24 --output-prefix outputs\speed_strategy
 ```
 
 ## Notes And Limits
