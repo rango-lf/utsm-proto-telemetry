@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Generated analysis and visualization artifacts.
+outputs/*
+!outputs/.gitkeep
+
+# Local captures and temporary inspection files.
+*.bin
+tmp_*.py

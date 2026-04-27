@@ -1,41 +1,33 @@
-# UTSM Telemetry Dumper
+# UTSM Proto Telemetry
 
-Small Python tooling for pulling telemetry off the car, aligning it with a GPX track, drawing lap heatmaps, and generating simple strategy/efficiency reports.
+Python tools for reading car telemetry, aligning it with GPX track data, splitting laps, analyzing energy use, and replaying runs in an interactive dashboard.
 
-## What This Project Does
+The current analysis path is centered on:
 
-There are really three jobs in this repo:
+1. `dumper.py` for serial telemetry capture.
+2. `utsm_telemetry/` for shared parsing, alignment, lap detection, motion, energy, and acceleration helpers.
+3. `analyze_strategy.py` for lap, sector, speed-bin, and strategy reports.
+4. `build_interactive_dashboard.py` for the fast local HTML replay dashboard.
 
-1. `dumper.py` talks to the serial device and saves a telemetry dump to CSV.
-2. `gps_current_heatmap.py` aligns telemetry to a timestamped GPX track and renders lap heatmaps.
-3. `analyze_strategy.py` reuses the same alignment and lap-splitting logic to turn a run into lap, sector, and speed-efficiency summaries.
+Generated artifacts are reproducible and ignored by Git. Regenerate reports and dashboards into `outputs/` when needed.
 
-In practice, the workflow is:
+## Setup
 
-1. Capture telemetry from the car.
-2. Export a GPX track from Strava or another GPS source.
-3. Align telemetry time to GPS time.
-4. Split the run into laps.
-5. Merge GPS motion with telemetry current/voltage.
-6. Summarize energy use and speed by lap and by sector.
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+```
 
-## Repo Layout
+Smoke tests can run without pytest:
 
-Current important files:
+```powershell
+python tests\test_smoke.py
+```
 
-- `dumper.py`: serial dump utility
-- `gps_current_heatmap.py`: GPX + telemetry alignment and heatmap generation
-- `analyze_strategy.py`: strategy and efficiency analysis
-- `Utsm.gpx`, `Utsm-2.gpx`: example GPX files
-- `telemetry_*.csv`: raw telemetry dumps from the logger
-- `*_strategy_report.txt`, `*_strategy_laps.csv`, `*_strategy_sectors.csv`, `*_strategy_speed_bins.csv`: generated analysis outputs
-- `morning run/`, `afternoon run/`, `old maps/`: saved heatmap images from previous runs
+## Data Inputs
 
-## Data Expectations
-
-### Telemetry CSV
-
-The analysis scripts expect these columns:
+Telemetry CSVs must include:
 
 - `timestamp_ms`
 - `current_mA`
@@ -44,242 +36,112 @@ The analysis scripts expect these columns:
 - `ay_x100`
 - `az_x100`
 
-`timestamp_ms` is treated as elapsed milliseconds from the start of the telemetry session. The scripts later convert that into absolute timestamps by anchoring it to GPX time.
+Some dumps also include `amag_x100`. Despite the column names, the MPU-6050 acceleration values in the 2026 afternoon data behave like milli-g units: about `1000` means `1 g`.
 
-### GPX
+GPX files must include latitude, longitude, elevation, and timestamps. Speed is derived from GPX point-to-point movement on the GPX sampling clock, not by integrating noisy accelerometer data.
 
-The GPX file must contain:
+## Current Afternoon Demo
 
-- latitude
-- longitude
-- elevation
-- timestamp for each track point
+The canonical afternoon demo uses:
 
-Without GPX timestamps, the alignment step cannot work.
+- `Utsm-2.gpx`
+- `telemetry_dumps\telemetry_20260411_122713.csv`
+- `--laps 3`
+- `--split-method start`
 
-## Setup
+The start split now uses a localized left-side start/finish gate. It ignores paddock movement before the real start and rejects the false right-side same-Y crossing.
 
-Create and activate a virtual environment, then install dependencies:
+## Interactive Dashboard
 
-```powershell
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
-```
-
-## How The Project Works
-
-### 1. Telemetry capture
-
-`dumper.py` opens a serial connection, optionally sends a command to trigger a dump, and writes everything it receives to a timestamped file like `telemetry_20260411_112302.csv`.
-
-Example:
+Build the dashboard:
 
 ```powershell
-python dumper.py --port COM13 --baud 115200
+python build_interactive_dashboard.py --laps 3 --output outputs\afternoon_interactive_dashboard.html
 ```
 
-Useful flags:
+Open `outputs\afternoon_interactive_dashboard.html` in a browser. It is a self-contained HTML file with:
 
-- `--idle-timeout`: stop after no new data arrives for a while
-- `--binary`: save raw bytes instead of text
-- `--command`: command sent to the device before reading
+- one manual time slider
+- play/pause replay
+- full-course gray reference trace
+- current-lap colored trail
+- synchronized current, speed, GPS acceleration, MPU dynamic acceleration, and power charts
+- color selector for track overlay metrics
+- optional lap-boundary debug markers
 
-### 2. Heatmap generation
+Acceleration is split into two separate channels:
 
-`gps_current_heatmap.py` does the heavy lifting for alignment and lap splitting:
+- `GPS acceleration`: derived from GPS speed changes, smoother and more physically interpretable for vehicle speed trend.
+- `MPU dynamic acceleration`: MPU-6050 axis data scaled as milli-g, bias/gravity corrected with a rolling median, and kept as a diagnostic vibration/response channel.
 
-- reads the GPX track into a dataframe
-- reads telemetry and coerces numeric columns
-- computes acceleration magnitude
-- aligns telemetry timestamps onto GPS time
-- merges each telemetry row to the nearest GPX point within a tolerance
-- converts lat/lon to approximate local XY meters
-- draws the track with color based on current or acceleration
+The dashboard payload also includes MPU axis/sign diagnostic correlations for `ax`, `-ax`, `ay`, `-ay`, `az`, and `-az`.
 
-Example:
+## Strategy Analysis
+
+Run the corrected afternoon analysis:
 
 ```powershell
-python gps_current_heatmap.py Utsm.gpx telemetry_20260411_112302.csv --laps 4 --split-method start
+python analyze_strategy.py Utsm-2.gpx telemetry_dumps\telemetry_20260411_122713.csv --laps 3 --split-method start --output-prefix outputs\afternoon_clean_demo
 ```
 
-#### Lap splitting modes
+This writes:
 
-`gps_current_heatmap.py` supports several ways to split laps:
+- `PREFIX_laps.csv`
+- `PREFIX_sectors.csv`
+- `PREFIX_speed_bins.csv`
+- `PREFIX_report.txt`
 
-- `start`: default and most race-aware; find the first big current spike, align that to the GPX trace, then detect lap boundaries using repeated crossings of the starting Y position
-- `line`: scan for a good horizontal lap line and split on crossings
-- `time`: divide the run into equal time windows
-- `points`: divide the GPX points evenly
+The analysis computes:
 
-There is also a manual mode with `--lap-times` if you already know the lap boundaries from Strava or timing notes.
+- lap duration and distance
+- GPX-derived speed
+- current, voltage, power, and integrated Wh
+- Wh/km efficiency
+- elevation gain/loss and grade
+- GPS acceleration and MPU dynamic acceleration
+- equal-distance sector summaries
+- flat-road speed efficiency bins
 
-### 3. Strategy analysis
+For the corrected afternoon run, the current reference result is 3 complete laps. Lap 2 is the most efficient full lap, while lap 3 is the fastest full lap.
 
-`analyze_strategy.py` is the new reporting layer. It imports helper functions from `gps_current_heatmap.py` instead of duplicating the alignment code.
+## Optional Animation Fallback
 
-High-level flow:
-
-1. Read GPX and telemetry.
-2. Align telemetry onto GPX time.
-3. Build laps using the selected split method.
-4. Merge each lap's GPS points with telemetry rows by nearest timestamp.
-5. Derive motion and energy features.
-6. Summarize the run at three levels.
-7. Write CSV outputs plus a text report with plain-English findings.
-
-Example:
+The interactive dashboard is the main visualization. The older animation scripts are kept as optional fallback/demo tools:
 
 ```powershell
-python analyze_strategy.py Utsm.gpx telemetry_20260411_112302.csv --laps 4 --segments 12 --split-method start --output-prefix afternoon_strategy
+python animate_run.py --help
+python build_animation_gallery.py --help
 ```
 
-## What The New Strategy Code Computes
-
-### Step 1: Merge GPS and telemetry
-
-For each lap, the script performs a nearest-time join between GPX points and telemetry rows. If the timestamps are too far apart, the row is dropped. This is controlled by `--tolerance-sec`.
-
-### Step 2: Derive motion and energy channels
-
-After merging, the script computes:
-
-- `dt_s`: time delta between points
-- `dist_m`: point-to-point distance in meters
-- `elev_diff_m`: elevation change
-- `speed_m_s` and `speed_kph`
-- `grade_pct`
-- `power_w`: from current and voltage
-- `energy_wh`: power integrated over each timestep
-- `cumdist_m`: cumulative distance through the lap
-
-That gives the strategy code enough information to reason about speed, climbing, and energy efficiency instead of just raw current.
-
-### Step 3: Build lap summary
-
-For each lap it calculates:
-
-- duration
-- distance
-- average speed
-- average and max current
-- average power
-- total energy in Wh
-- efficiency in Wh/km
-- elevation gain and loss
-
-This becomes the `*_laps.csv` file.
-
-### Step 4: Build sector summary
-
-Each lap is split into equal-distance sectors, controlled by `--segments` (default `12`). For every sector it calculates:
-
-- duration
-- distance
-- average speed
-- average power
-- average and max current
-- energy
-- Wh/km
-- average grade
-- peak speed
-
-This becomes `*_sectors.csv`.
-
-Equal-distance sectors are useful because they make lap-to-lap comparisons cleaner than equal-time sectors when one lap is faster than another.
-
-### Step 5: Build flat-speed efficiency bins
-
-The script also pools all laps together and looks only at samples where:
-
-- speed is between 5 and 70 km/h
-- absolute grade is at most 1%
-
-Those points are grouped into 5 km/h bins, and the script calculates Wh/km for each band. This is trying to answer:
-
-"On roughly flat sections, what cruising speed seems most efficient?"
-
-This becomes `*_speed_bins.csv`.
-
-### Step 6: Generate plain-English findings
-
-The report text is not just a dump of tables. The code also creates short strategy takeaways:
-
-- most efficient full lap
-- fastest full lap
-- whether the fastest and most efficient lap were the same lap
-- best and worst flat-speed efficiency bands
-- biggest sector improvement between the latest two full laps
-- biggest remaining sector efficiency loss
-
-The "full lap" logic intentionally ignores obviously short laps by keeping laps whose distance is at least about 90% of the median lap distance. That helps stop warm-up or partial laps from dominating the conclusions.
-
-## Output Files
-
-Running `analyze_strategy.py` writes:
-
-- `PREFIX_report.txt`: readable summary and findings
-- `PREFIX_laps.csv`: one row per lap
-- `PREFIX_sectors.csv`: one row per sector per lap
-- `PREFIX_speed_bins.csv`: pooled efficiency by flat-road speed band
-
-Running `gps_current_heatmap.py` writes:
-
-- one heatmap image, or
-- one image per lap like `current_heatmap_lap1.png`
-
-## Interpreting The Existing Afternoon Output
-
-Your current `afternoon_strategy_report.txt` says:
-
-- lap 4 was both the fastest and the most efficient full lap
-- flat-section efficiency was best around 18 km/h and worst around 33 km/h
-- sector 11 improved the most from lap 3 to lap 4
-- sector 3 was the main efficiency regression still left in lap 4
-
-That suggests the last lap was not just quicker because of more power. It was also materially cleaner in energy use, which usually means smoother pacing or fewer inefficient surges.
+Use them only when a pre-rendered GIF/HTML gallery is specifically needed. They are slower and less useful for data inspection than the interactive dashboard.
 
 ## Common Commands
 
-Capture telemetry:
+Capture telemetry from the serial device:
 
 ```powershell
 python dumper.py --port COM13
 ```
 
-Generate per-lap heatmaps:
+Generate legacy current heatmaps:
 
 ```powershell
-python gps_current_heatmap.py Utsm.gpx telemetry_20260411_112302.csv --laps 4 --split-method start --output current_heatmap.png
+python gps_current_heatmap.py Utsm.gpx telemetry_dumps\telemetry_20260411_112302.csv --laps 4 --split-method start --output outputs\current_heatmap.png
 ```
 
-Generate strategy report:
+Run smoke tests and regenerate the afternoon demo:
 
 ```powershell
-python analyze_strategy.py Utsm.gpx telemetry_20260411_112302.csv --laps 4 --segments 12 --split-method start --output-prefix run1_strategy
+python tests\test_smoke.py
+python build_interactive_dashboard.py --laps 3 --output outputs\afternoon_interactive_dashboard.html
+python analyze_strategy.py Utsm-2.gpx telemetry_dumps\telemetry_20260411_122713.csv --laps 3 --split-method start --output-prefix outputs\afternoon_clean_demo
 ```
 
-Use a manual timing offset if telemetry and GPX are slightly misaligned:
+## Notes And Limits
 
-```powershell
-python analyze_strategy.py Utsm.gpx telemetry_20260411_112302.csv --laps 4 --time-offset-ms 750 --output-prefix run1_strategy
-```
-
-## Limits And Assumptions
-
-- XY position is a local flat-earth approximation, which is fine for short tracks but not a geodesic solution.
-- Nearest-time merging assumes GPS and telemetry clocks are close after alignment.
-- Energy is estimated from current and voltage only; it does not include drivetrain efficiency modeling.
-- Sector analysis is distance-based, not corner-based.
-- The default `start` lap detection assumes a strong launch current spike and a repeatable crossing of the start-line Y band.
-
-## Suggested Next Cleanup
-
-If you want to keep developing this, the next sensible cleanup would be:
-
-1. move generated outputs into an `outputs/` folder
-2. move reusable helpers into a `utsm_telemetry/` package
-3. add a small sample dataset and one smoke test
-4. add a plotting script for sector deltas across laps
-
-For now, this README should make the current layout much easier to navigate without breaking the existing workflow.
+- XY position is a local flat-earth approximation, which is fine for this track scale.
+- Nearest-time merging assumes telemetry and GPX clocks can be aligned closely enough.
+- Energy is electrical energy estimated from current and voltage; it is not drivetrain output energy.
+- GPS acceleration is low bandwidth because it comes from GPX speed changes.
+- MPU dynamic acceleration is useful for diagnostics, but sensor orientation and gravity compensation are still imperfect without gyro fusion or a known mounting calibration.
+- Generated outputs, caches, and local scratch artifacts should stay out of Git.
