@@ -21,11 +21,11 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
-from analyze_strategy import build_laps
 from utsm_telemetry import (
     FORWARD_AXIS_CHOICES,
     add_xy,
     build_full_run_distance,
+    build_laps,
     build_motor_config,
     build_strategy_report,
     build_strategy_samples,
@@ -39,6 +39,8 @@ from utsm_telemetry import (
     read_gpx,
     read_telemetry,
 )
+
+from utsm_telemetry.simulation import _longest_true_duration as longest_true_duration
 
 DEFAULT_RUNS = [
     {
@@ -152,7 +154,16 @@ def resolve_run_specs(args: argparse.Namespace) -> list[dict[str, str]]:
 def load_single_run(spec: dict[str, str], args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame, str]:
     gps_df = read_gpx(spec["gps"])
     telem_df = read_telemetry(spec["telemetry"])
-    gps_laps, telem_laps, _ = build_laps(gps_df, telem_df, args)
+    gps_laps, telem_laps, _ = build_laps(
+        gps_df,
+        telem_df,
+        laps=args.laps,
+        split_method=args.split_method,
+        start_time=args.start_time,
+        time_offset_ms=args.time_offset_ms,
+        tolerance_sec=args.tolerance_sec,
+        lap_times=args.lap_times,
+    )
 
     rows = []
     for lap_num, (lap_gps, lap_telem) in enumerate(zip(gps_laps, telem_laps), start=1):
@@ -581,18 +592,6 @@ def make_payload(run_payloads: list[dict[str, Any]], args: argparse.Namespace) -
             "reference": {"label": "Reference track", "color": "#d0d5dc"},
         },
     }
-
-
-def longest_true_duration(flags: list[bool], durations: list[float]) -> float:
-    best = 0.0
-    run = 0.0
-    for flag, duration in zip(flags, durations):
-        if flag:
-            run += float(duration)
-            best = max(best, run)
-        else:
-            run = 0.0
-    return best
 
 
 def build_html(payload: dict[str, Any]) -> str:
