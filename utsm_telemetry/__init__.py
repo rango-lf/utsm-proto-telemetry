@@ -30,6 +30,7 @@ from .core import (
     add_gps_acceleration_features,
     compute_accel_candidate_scores,
     derive_motion_energy,
+    build_laps,
 )
 from .simulation import (
     ACTION_ACCELERATE,
@@ -75,6 +76,7 @@ __all__ = [
     "add_gps_acceleration_features",
     "compute_accel_candidate_scores",
     "derive_motion_energy",
+    "build_laps",
     "ACTION_ACCELERATE",
     "ACTION_HOLD",
     "ACTION_COAST",
