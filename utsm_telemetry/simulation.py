@@ -19,8 +19,8 @@ DEFAULT_MOTOR_PROFILE = {
     "vehicle_mass_kg": 100.0,
     "rolling_resistance_coeff": 0.008,
     "drivetrain_efficiency": 0.82,
+    "corner_drag_factor": 0.1,   # fraction of centripetal force treated as drag
 }
-
 
 def build_full_run_distance(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy().sort_values("time").reset_index(drop=True)
@@ -44,6 +44,7 @@ def build_motor_config(
     vehicle_mass_kg: float = 100.0,
     rolling_resistance_coeff: float = 0.008,
     drivetrain_efficiency: float = 0.82,
+    corner_drag_factor: float = 0.1,
 ) -> dict[str, float | str]:
     if wheel_diameter_m <= 0:
         raise ValueError("wheel_diameter_m must be positive.")
@@ -59,6 +60,7 @@ def build_motor_config(
         motor_top_rpm=float(config["nominal_speed_rpm"]),
         wheel_diameter_m=wheel_diameter_m,
     )
+    config["corner_drag_factor"] = float(corner_drag_factor)
     return config
 
 
@@ -104,6 +106,11 @@ def build_strategy_segments(df: pd.DataFrame, segments: int) -> pd.DataFrame:
             "center_frac": ((lo + hi) * 0.5) / total_dist,
             "baseline_speed_kph": float(speed.median()) if not speed.empty else 0.0,
             "baseline_grade_pct": float(grade.mean()) if not grade.empty else 0.0,
+            "baseline_curvature_1_m": float(
+                pd.to_numeric(seg.get("curvature_1_m"), errors="coerce")
+                .dropna()
+                .median()
+            ) if "curvature_1_m" in seg.columns else 0.0,
             "baseline_current_mA": float(current.mean()) if not current.empty else 0.0,
             "baseline_power_w": float(power.mean()) if not power.empty else 0.0,
             "baseline_energy_j": float(energy_j),
@@ -213,6 +220,7 @@ def predict_strategy_electrical(
     position_frac: float,
     action: str,
     motor_config: dict[str, float | str] | None = None,
+    curvature_1_m: float = 0.0,
 ) -> dict[str, float]:
     if action == ACTION_COAST:
         return {
@@ -249,7 +257,9 @@ def predict_strategy_electrical(
     on_current = float(model.get("on_current_mA", max(raw_current, 1000.0)))
     cruise_current = float(model.get("cruise_current_mA", raw_current))
     voltage_v = float(model.get("median_voltage_v", 24.0))
-    physics_power_w = _physics_propulsion_power_w(speed_kph, accel_m_s2, grade_pct, motor_config)
+    physics_power_w = _physics_propulsion_power_w(
+        speed_kph, accel_m_s2, grade_pct, motor_config, curvature_1_m=curvature_1_m,
+    )
     physics_current_mA = physics_power_w / max(voltage_v, 1.0) * 1000.0
     if action == ACTION_ACCELERATE:
         duty = _clamp(0.22 + max(accel_m_s2, 0.0) * 1.8, 0.18, 1.0)
@@ -324,6 +334,7 @@ def optimize_speed_profile(
                     action = classify_strategy_action(delta_kph, hold_delta_kph=hold_delta_kph)
                     accel_m_s2 = _signed_accel_from_speed_change(float(prev_speed), speed, length_m)
                     time_s = _segment_transition_time_s(length_m, float(prev_speed), speed)
+                    curvature_1_m = float(row.get("baseline_curvature_1_m", 0.0))
                     electrical = predict_strategy_electrical(
                         model,
                         speed_kph=speed,
@@ -332,6 +343,7 @@ def optimize_speed_profile(
                         position_frac=position_frac,
                         action=action,
                         motor_config=motor_config,
+                        curvature_1_m=curvature_1_m,
                     )
                     pred_current_mA = electrical["avg_current_mA"]
                     pred_power_w = electrical["avg_power_w"]
@@ -744,17 +756,39 @@ def _physics_propulsion_power_w(
     accel_m_s2: float,
     grade_pct: float,
     motor_config: dict[str, float | str] | None,
+    curvature_1_m: float = 0.0,
 ) -> float:
+    """Estimate mechanical propulsive power in watts.
+ 
+    Force components (all in Newtons):
+      F_roll  = m * g * Crr                        (rolling resistance)
+      F_slope = m * g * (grade_pct / 100)          (hill climb / descent)
+      F_accel = m * a                               (Newton's 2nd law)
+      F_corner = corner_drag_factor * m * v² * κ   (corner resistance)
+ 
+    Power = F_total * v / η  (η = drivetrain efficiency)
+ 
+    F_corner uses a drag-factor approximation: the car doesn't consume
+    forward power equal to full centripetal force, but tyre scrub in
+    corners adds effective rolling resistance proportional to it.
+    The factor (default 0.1) can be calibrated from cornering coastdown
+    data if available.
+    """
     if motor_config is None:
         return 0.0
     speed_m_s = max(speed_kph / 3.6, 0.0)
     mass_kg = float(motor_config.get("vehicle_mass_kg", 100.0))
     crr = float(motor_config.get("rolling_resistance_coeff", 0.008))
     efficiency = max(float(motor_config.get("drivetrain_efficiency", 0.82)), 0.05)
+    corner_drag_factor = float(motor_config.get("corner_drag_factor", 0.1))
+ 
+    rolling_force = mass_kg * 9.80665 * crr
     grade_force = mass_kg * 9.80665 * (grade_pct / 100.0)
     accel_force = mass_kg * max(accel_m_s2, 0.0)
-    rolling_force = mass_kg * 9.80665 * crr
-    propulsive_force = max(accel_force + grade_force + rolling_force, 0.0)
+    # Centripetal: F = m*v²*κ, scaled by drag factor
+    corner_force = corner_drag_factor * mass_kg * (speed_m_s ** 2) * max(curvature_1_m, 0.0)
+ 
+    propulsive_force = max(rolling_force + grade_force + accel_force + corner_force, 0.0)
     return float(propulsive_force * speed_m_s / efficiency)
 
 
