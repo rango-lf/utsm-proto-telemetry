@@ -23,6 +23,7 @@ from .core import (
     detect_lap_line,
     compute_distance,
     compute_lap_stats,
+    haversine_m,
     split_gps_into_laps,
     align_telemetry,
     merge_by_time,
@@ -93,4 +94,5 @@ __all__ = [
     "build_strategy_samples",
     "evaluate_baseline_prediction",
     "build_strategy_report",
+    "havesine_m",
 ]
