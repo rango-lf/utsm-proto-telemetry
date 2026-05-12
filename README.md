@@ -68,7 +68,7 @@ The `utsm_telemetry/` folder is a **shared library**. It contains all the reusab
 
 ## Setup
 
-Requires Python 3.11+. Run these commands once when you clone the repo:
+Requires Python 3.11+. Run these commands (line-by-line) once when you clone the repo:
 
 ```powershell
 python -m venv .venv
@@ -273,8 +273,8 @@ This folder contains all the shared logic. You don't run these files directly �
 **`core.py`** — everything to do with GPS and telemetry data itself:
 - Reading GPX files and telemetry CSVs
 - Aligning the two clocks so GPS and telemetry are in sync
-- Detecting where each lap starts and ends (using line-segment intersection at the start/finish line)
-- Computing Haversine distances, track curvature, speed, grade, and acceleration channels
+- ~~Detecting where each lap starts and ends (using line-segment intersection at the start/finish line)~~
+- ~~Computing Haversine distances, track curvature, speed, grade, and acceleration channels~~
 - Merging GPS and telemetry rows by nearest timestamp
 
 **`simulation.py`** — the strategy and physics layer:
