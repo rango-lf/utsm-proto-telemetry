@@ -129,33 +129,12 @@ def add_xy(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def haversine_m(
-    lat1: "float | np.ndarray",
-    lon1: "float | np.ndarray",
-    lat2: "float | np.ndarray",
-    lon2: "float | np.ndarray",
-) -> "float | np.ndarray":
-    """Great-circle distance in metres between one or more coordinate pairs.
- 
-    Works element-wise on NumPy arrays as well as plain floats.
-    Uses the Haversine formula as recommended by the SEM bootcamp.
-    """
-    R = 6_371_000.0  # Earth radius in metres
-    phi1 = np.deg2rad(lat1)
-    phi2 = np.deg2rad(lat2)
-    dphi = np.deg2rad(lat2 - lat1)
-    dlam = np.deg2rad(lon2 - lon1)
-    a = np.sin(dphi / 2) ** 2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlam / 2) ** 2
-    return 2.0 * R * np.arcsin(np.sqrt(np.clip(a, 0.0, 1.0)))
- 
- 
 def compute_distance(df: pd.DataFrame) -> float:
-    """Total track distance in metres using Haversine formula."""
-    if len(df) < 2:
+    """Total track distance in metres using flat-earth XY."""
+    coords = add_xy(df)[["x", "y"]].to_numpy()
+    if len(coords) < 2:
         return 0.0
-    lats = df["lat"].to_numpy()
-    lons = df["lon"].to_numpy()
-    return float(haversine_m(lats[:-1], lons[:-1], lats[1:], lons[1:]).sum())
+    return float(np.linalg.norm(coords[1:] - coords[:-1], axis=1).sum())
 
 
 def add_gps_motion_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -170,15 +149,11 @@ def add_gps_motion_features(df: pd.DataFrame) -> pd.DataFrame:
     times = pd.to_datetime(df["time"])
     df["gps_time"] = times
     df["gps_dt_s"] = times.diff().dt.total_seconds().fillna(0.0).clip(lower=0)
- 
-    lats = df["lat"].to_numpy()
-    lons = df["lon"].to_numpy()
- 
-    # Haversine segment distances (replaces flat-earth norm).
-    # More accurate at track scale and consistent with the bootcamp formula.
-    seg = np.zeros(len(lats))
-    if len(lats) > 1:
-        seg[1:] = haversine_m(lats[:-1], lons[:-1], lats[1:], lons[1:])
+
+    xy = df[["x", "y"]].to_numpy()
+    seg = np.zeros(len(xy))
+    if len(xy) > 1:
+        seg[1:] = np.linalg.norm(xy[1:] - xy[:-1], axis=1)
     df["gps_dist_m"] = seg
     df["gps_cumdist_m"] = df["gps_dist_m"].cumsum()
     df["gps_speed_m_s_raw"] = np.where(
@@ -192,37 +167,6 @@ def add_gps_motion_features(df: pd.DataFrame) -> pd.DataFrame:
         .median()
     )
     df["gps_speed_kph"] = df["gps_speed_m_s"] * 3.6
- 
-    # Heading and curvature.
-    # heading_deg: compass bearing (0° = North, clockwise) of each segment. curvature_1_m: κ = |Δheading_rad| / Δdistance — how sharply the track bends per metre.  κ = 1/r, so r = 1/κ.  Smoothed over a 5-point window to reduce GPS noise.
-    if len(lats) > 1:
-        dlat = np.deg2rad(np.diff(lats))
-        dlon = np.deg2rad(np.diff(lons))
-        lat_r = np.deg2rad(lats[:-1])
-        x_comp = np.sin(dlon) * np.cos(np.deg2rad(lats[1:]))
-        y_comp = np.cos(lat_r) * np.sin(np.deg2rad(lats[1:])) - np.sin(lat_r) * np.cos(np.deg2rad(lats[1:])) * np.cos(dlon)
-        bearing = np.degrees(np.arctan2(x_comp, y_comp)) % 360.0
-        heading = np.zeros(len(lats))
-        heading[1:] = bearing
-        heading[0] = bearing[0]
-    else:
-        heading = np.zeros(len(lats))
-    df["heading_deg"] = heading
- 
-    # Angular change between consecutive headings (shortest arc, in radians)
-    delta_heading_rad = np.zeros(len(lats))
-    if len(lats) > 1:
-        raw_delta = np.diff(heading)
-        # Wrap to [-180, 180] then convert to radians
-        wrapped = (raw_delta + 180.0) % 360.0 - 180.0
-        delta_heading_rad[1:] = np.abs(np.deg2rad(wrapped))
- 
-    curvature_raw = np.where(seg > 0.1, delta_heading_rad / seg, 0.0)
-    df["curvature_1_m"] = (
-        pd.Series(curvature_raw)
-        .rolling(window=5, min_periods=1, center=True)
-        .median()
-    )
     return df
 
 
@@ -309,164 +253,110 @@ def find_lap_boundaries_by_y_crossing(
     return boundaries
 
 
-def _line_segment_intersect(
-    p1: np.ndarray,
-    p2: np.ndarray,
-    p3: np.ndarray,
-    p4: np.ndarray,
-) -> bool:
-    """Return True if segment p1→p2 crosses segment p3→p4.
- 
-    Uses the parametric line-line intersection formula:
-    https://en.wikipedia.org/wiki/Line%E2%80%93line_intersection
-    t and u are the fractional positions along each segment; a crossing
-    exists only when both lie in [0, 1].
-    """
-    d1 = p2 - p1
-    d2 = p4 - p3
-    denom = d1[0] * d2[1] - d1[1] * d2[0]
-    if abs(denom) < 1e-10:
-        return False  # parallel or collinear — no crossing
-    diff = p3 - p1
-    t = (diff[0] * d2[1] - diff[1] * d2[0]) / denom
-    u = (diff[0] * d1[1] - diff[1] * d1[0]) / denom
-    return 0.0 <= t <= 1.0 and 0.0 <= u <= 1.0
- 
- 
-def _build_finish_line(
-    xy: np.ndarray,
-    anchor_idx: int,
-    half_width_m: float = 15.0,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Construct a finish line perpendicular to the track at anchor_idx.
- 
-    Looks one step ahead to get the local heading, then rotates 90° to
-    define a line that cuts across the track.
- 
-    Returns two endpoints (p3, p4) in XY metres.
-    """
-    next_idx = min(anchor_idx + 1, len(xy) - 1)
-    direction = xy[next_idx] - xy[anchor_idx]
-    norm = np.linalg.norm(direction)
-    if norm < 1e-6:
-        # Degenerate: car not moving — use an axis-aligned east-west line
-        perp = np.array([1.0, 0.0])
-    else:
-        direction = direction / norm
-        perp = np.array([-direction[1], direction[0]])  # 90° rotation
- 
-    anchor = xy[anchor_idx]
-    return anchor - perp * half_width_m, anchor + perp * half_width_m
- 
- 
 def find_lap_boundaries_by_start_gate(
     gps: pd.DataFrame,
     start_index: int,
     laps: int,
+    y_band_width: float = 5.0,
+    x_window_width: float = 60.0,
     min_gap_points: int = 50,
     min_lap_distance_m: float = 2500.0,
     pre_race_max_distance_m: float = 1000.0,
-    finish_line_half_width_m: float = 15.0,
 ) -> list[int]:
-    """Detect lap boundaries via line-segment intersection at start/finish.
- 
-    Replaces the bounding-box gate detector.  Draws a perpendicular line
-    across the track at the anchor point (the start/finish line) and counts
-    every time a consecutive GPS segment crosses it — identical in spirit to
-    the method described in the SEM Data & Telemetry Bootcamp 2026 (slide 41).
- 
-    Parameters
-    ----------
-    gps:
-        GPS DataFrame (lat, lon, time).  Must already be trimmed to start
-        at or after the current spike (i.e. gps_df.loc[gps_start_idx:]).
-    start_index:
-        Row index in ``gps`` corresponding to the telemetry current spike.
-    laps:
-        Expected number of racing laps (used only for the progress message).
-    min_gap_points:
-        Minimum GPS points between two crossings to avoid double-counting
-        the car lingering near the line.
-    min_lap_distance_m:
-        Crossings that happen closer than this distance from the previous
-        boundary are ignored (catches pre-race slow-rolls).
-    pre_race_max_distance_m:
-        After the spike, the car may still move around before the real line.
-        The first re-crossing within this distance is used to anchor the
-        finish line more precisely.
-    finish_line_half_width_m:
-        Half the width of the virtual finish line drawn across the track.
-        Should be wider than the track is wide; 15 m is safe for most
-        Shell Eco-Marathon venues.
+    """Detect lap boundaries at a localized start/finish gate.
+
+    The current spike can occur while the car is still moving around before the
+    real line.  First find that short pre-race return to the start Y band, then
+    count only future re-entries near the same X/Y anchor.
     """
     gps_xy = add_xy(gps).reset_index(drop=True)
     if gps_xy.empty:
         return []
     if start_index < 0 or start_index >= len(gps_xy):
         raise IndexError("start_index is outside the GPS data range.")
- 
+
     xy = gps_xy[["x", "y"]].to_numpy()
- 
-    # Cumulative Haversine distances (consistent with compute_distance)
-    lats = gps_xy["lat"].to_numpy()
-    lons = gps_xy["lon"].to_numpy()
-    seg_dists = np.zeros(len(lats))
-    if len(lats) > 1:
-        seg_dists[1:] = haversine_m(lats[:-1], lons[:-1], lats[1:], lons[1:])
+    seg_dists = np.zeros(len(xy))
+    if len(xy) > 1:
+        seg_dists[1:] = np.linalg.norm(xy[1:] - xy[:-1], axis=1)
     cum_dist = np.cumsum(seg_dists)
- 
-    # --- Step 1: find anchor (actual start/finish line position) ---
-    # Build an initial finish line at the spike location, then check if the
-    # car crosses it again within pre_race_max_distance_m (pre-race roll).
-    # If so, use that crossing as the true anchor.
+
+    y_start = float(gps_xy.loc[start_index, "y"])
+    y = gps_xy["y"].to_numpy()
+
     anchor_idx = start_index
-    p3, p4 = _build_finish_line(xy, anchor_idx, finish_line_half_width_m)
- 
-    for idx in range(start_index + 1, len(xy)):
-        if cum_dist[idx] - cum_dist[start_index] > pre_race_max_distance_m:
-            break
-        if idx < min_gap_points:
+    escaped = False
+    in_band = False
+    crossing_count = 0
+    for idx in range(start_index + 1, len(gps_xy)):
+        near_y = abs(y[idx] - y_start) <= y_band_width
+
+        if not escaped:
+            if not near_y:
+                escaped = True
+                in_band = False
             continue
-        if _line_segment_intersect(xy[idx - 1], xy[idx], p3, p4):
-            anchor_idx = idx
-            break
- 
-    # Rebuild finish line at the (possibly updated) anchor
-    p3, p4 = _build_finish_line(xy, anchor_idx, finish_line_half_width_m)
- 
-    # --- Step 2: walk the rest of the track counting crossings ---
-    boundaries = [anchor_idx]
-    last_boundary_idx = anchor_idx
-    points_since_last = 0
- 
-    for idx in range(anchor_idx + 1, len(xy)):
-        points_since_last += 1
-        if points_since_last < min_gap_points:
-            continue
-        if not _line_segment_intersect(xy[idx - 1], xy[idx], p3, p4):
-            continue
- 
-        lap_dist = cum_dist[idx] - cum_dist[last_boundary_idx]
-        if lap_dist < min_lap_distance_m:
-            print(
-                f"  Ignoring short crossing at GPS index {idx} "
-                f"({lap_dist:.0f} m from last boundary — pre-race movement?)."
-            )
-            continue
- 
-        boundaries.append(idx)
-        last_boundary_idx = idx
-        points_since_last = 0
- 
-        if len(boundaries) >= laps + 1:
-            break
- 
+
+        if near_y and not in_band:
+            in_band = True
+            if idx - start_index < min_gap_points:
+                continue
+            crossing_count += 1
+            if crossing_count % 2 == 0:
+                pre_race_dist = cum_dist[idx] - cum_dist[start_index]
+                if pre_race_dist <= pre_race_max_distance_m:
+                    anchor_idx = idx
+                break
+        elif not near_y:
+            in_band = False
+
     anchor_x = float(gps_xy.loc[anchor_idx, "x"])
     anchor_y = float(gps_xy.loc[anchor_idx, "y"])
+
+    def inside_gate(idx: int) -> bool:
+        return (
+            abs(float(gps_xy.loc[idx, "y"]) - anchor_y) <= y_band_width
+            and abs(float(gps_xy.loc[idx, "x"]) - anchor_x) <= x_window_width
+        )
+
+    boundaries = [anchor_idx]
+    current_lap_start_idx = anchor_idx
+    escaped_gate = False
+    in_gate = True
+
+    for idx in range(anchor_idx + 1, len(gps_xy)):
+        inside = inside_gate(idx)
+
+        if not escaped_gate:
+            if not inside:
+                escaped_gate = True
+                in_gate = False
+            continue
+
+        if inside and not in_gate:
+            in_gate = True
+            if idx - current_lap_start_idx < min_gap_points:
+                continue
+
+            lap_dist = cum_dist[idx] - cum_dist[current_lap_start_idx]
+            if lap_dist < min_lap_distance_m:
+                print(
+                    f"  Skipping short start-gate re-entry ({lap_dist:.0f}m) "
+                    f"at GPS index {idx}."
+                )
+                continue
+
+            boundaries.append(idx)
+            current_lap_start_idx = idx
+            if len(boundaries) >= laps + 1:
+                break
+        elif not inside:
+            in_gate = False
+
     print(
-        f"Line-segment crossing detection: "
-        f"finish line anchored at ({anchor_x:.1f} m, {anchor_y:.1f} m), "
-        f"found {len(boundaries) - 1} lap boundary/ies (wanted {laps})."
+        "Start-gate detection: "
+        f"anchor=({anchor_x:.1f}m, {anchor_y:.1f}m), "
+        f"found {len(boundaries) - 1} lap boundaries (wanted {laps})."
     )
     return boundaries
 
