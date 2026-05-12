@@ -120,20 +120,16 @@ After a test, you should run these four commands in order. The first two generat
 
 ```powershell
 # 1. Lap reports and efficiency analysis
-python analyze_strategy.py Utsm-2.gpx telemetry_dumps\telemetry_20260411_122713.csv ^
-    --laps 4 --split-method start --output-prefix outputs\afternoon
+python analyze_strategy.py Utsm-2.gpx telemetry_dumps\telemetry_20260411_122713.csv --laps 4 --split-method start --output-prefix outputs\afternoon
 
 # 2. Speed strategy optimisation
-python simulate_speed_strategy.py Utsm-2.gpx telemetry_dumps\telemetry_20260411_122713.csv ^
-    --laps 4 --split-method start --segments 24 --time-budget-sec 2100 ^
-    --output-prefix outputs\afternoon_strategy
+python simulate_speed_strategy.py Utsm-2.gpx telemetry_dumps\telemetry_20260411_122713.csv --laps 4 --split-method start --segments 24 --time-budget-sec 2100 --output-prefix outputs\afternoon_strategy
 
 # 3. Interactive dashboard (covers both morning and afternoon runs)
 python build_interactive_dashboard.py --laps 4 --output outputs\dashboard.html
 
 # 4. Current heatmap images (one PNG per lap)
-python gps_current_heatmap.py Utsm-2.gpx telemetry_dumps\telemetry_20260411_122713.csv ^
-    --laps 4 --split-method start --output outputs\heatmap.png
+python gps_current_heatmap.py Utsm-2.gpx telemetry_dumps\telemetry_20260411_122713.csv --laps 4 --split-method start --output outputs\heatmap.png
 ```
 
 Then open `outputs\dashboard.html` in any browser.
@@ -153,8 +149,7 @@ Reads serial data from the on-board computer and saves it as a timestamped CSV i
 The main post-run analysis tool. Aligns the GPX track with the telemetry, splits into laps, and produces CSV summaries and a plain-text findings report.
 
 ```powershell
-python analyze_strategy.py Utsm-2.gpx telemetry_dumps\telemetry_20260411_122713.csv ^
-    --laps 4 --split-method start --output-prefix outputs\afternoon
+python analyze_strategy.py Utsm-2.gpx telemetry_dumps\telemetry_20260411_122713.csv --laps 4 --split-method start --output-prefix outputs\afternoon
 ```
 
 **Outputs written to `outputs/`:**
@@ -173,10 +168,7 @@ python analyze_strategy.py Utsm-2.gpx telemetry_dumps\telemetry_20260411_122713.
 Takes the historical run data and works out the most efficient `accelerate / hold / coast` strategy for each segment of the track, within a given time budget.
 
 ```powershell
-python simulate_speed_strategy.py Utsm-2.gpx telemetry_dumps\telemetry_20260411_122713.csv ^
-    --laps 4 --split-method start --segments 24 ^
-    --time-budget-sec 2100 --fuse-current-ma 20000 --fuse-max-duration-sec 1.0 ^
-    --output-prefix outputs\strategy
+python simulate_speed_strategy.py Utsm-2.gpx telemetry_dumps\telemetry_20260411_122713.csv --laps 4 --split-method start --segments 24 --time-budget-sec 2100 --fuse-current-ma 20000 --fuse-max-duration-sec 1.0 --output-prefix outputs\strategy
 ```
 
 **Key flags:**
@@ -233,8 +225,7 @@ Open the output file in any browser.
 Produces one PNG image per lap showing where on the track current draw is high or low. Good for quickly spotting where energy is being used on track.
 
 ```powershell
-python gps_current_heatmap.py Utsm-2.gpx telemetry_dumps\telemetry_20260411_122713.csv ^
-    --laps 4 --split-method start --output outputs\heatmap.png
+python gps_current_heatmap.py Utsm-2.gpx telemetry_dumps\telemetry_20260411_122713.csv --laps 4 --split-method start --output outputs\heatmap.png
 ```
 
 Use `--metric current` (default), `--metric accel`, or `--metric magnitude` to colour by a different channel.
@@ -246,8 +237,7 @@ Use `--metric current` (default), `--metric accel`, or `--metric magnitude` to c
 Produces an animated GIF or HTML replay of a single run with a moving marker and live chart. Slower and less interactive than the dashboard — use this when you need a shareable animation file rather than a live tool.
 
 ```powershell
-python animate_run.py Utsm-2.gpx telemetry_dumps\telemetry_20260411_122713.csv ^
-    --laps 4 --split-method start --output outputs\animation.html
+python animate_run.py Utsm-2.gpx telemetry_dumps\telemetry_20260411_122713.csv --laps 4 --split-method start --output outputs\animation.html
 ```
 
 ---
