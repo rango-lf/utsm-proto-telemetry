@@ -68,12 +68,13 @@ The `utsm_telemetry/` folder is a **shared library**. It contains all the reusab
 
 ## Setup
 
-Requires Python 3.11+. Run these commands (line-by-line) once when you clone the repo:
+Requires Python 3.11+, Matplotlib, Pandas, and Numpy. Run these commands (line-by-line) once when you clone the repo:
 
 ```powershell
 python -m venv .venv
 .venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
+pip install matplotlib pandas numpy
 ```
 
 On macOS/Linux, replace `Activate.ps1` with `source .venv/bin/activate`.
