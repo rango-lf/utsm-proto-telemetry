@@ -93,5 +93,4 @@ __all__ = [
     "build_strategy_samples",
     "evaluate_baseline_prediction",
     "build_strategy_report",
-    "havesine_m",
 ]
